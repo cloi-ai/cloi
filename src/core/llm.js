@@ -568,8 +568,8 @@ INSTRUCTIONS:
 4. You MUST output ONLY ONE of these exact phrases, and no additional thoughts: "TERMINAL_COMMAND_ERROR" or "CODE_FILE_ISSUE"
 
 Output ONLY ONE of these exact phrases. No need for long explanations. Just a simple single word output:
-'TERMINAL_ISSUE',
-'CODE_ISSUE'
+'TERMINAL_COMMAND_ERROR',
+'CODE_FILE_ISSUE'
 `.trim();
     
     // Run the analysis using the TempScript approach
