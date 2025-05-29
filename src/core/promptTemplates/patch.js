@@ -134,7 +134,7 @@ Instructions:
 3. For deletions, include old_line but set new_line to null
 4. For additions, set line_number of the line that comes before and set old_line to ""
 5. The line_number should correspond to the line number in the original file
-6. As of now, please do not attempt to create new files.`;
+6. Please do not create new files.`;
 
   // Add user context focus if provided
   if (userContext) {

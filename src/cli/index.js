@@ -1767,6 +1767,9 @@ async function conversationalDebugLoop(initialCmd, limit, currentModel, errorInf
     
     // Display error context first
     if (errorInfo) {
+      // Show the terminal log command before displaying the error message
+      await echoCommand('tail -n 750 ~/.cloi/terminal_output.log');
+      
       if (errorInfo.files && errorInfo.files.size > 0) {
         const fileNames = Array.from(errorInfo.files.keys()).map(file => path.basename(file));
         const filesText = fileNames.join(', ');
