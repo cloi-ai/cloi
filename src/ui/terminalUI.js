@@ -176,6 +176,105 @@ export async function askYesNo(question = '', silent = false) {
   });
 }
 
+/* ─────────────────────────  Multi-line Input Handling  ─────────────────────────── */
+/**
+ * Prompts for multi-line input that properly handles pasted content.
+ * Uses a simpler approach with readline for basic functionality and paste detection.
+ * User presses Enter twice to submit, or Ctrl+D to submit immediately.
+ * @param {string} [prompt='> '] - The prompt to display
+ * @returns {Promise<string>} - The user's input
+ */
+export async function askMultiLineInput(prompt = '> ') {
+  closeReadline();
+  
+  return new Promise((resolve) => {
+    let lines = [];
+    let lastInputTime = 0;
+    let enterPressed = false;
+    
+    const DOUBLE_ENTER_THRESHOLD = 800; // ms for double-enter detection (increased from 500ms)
+    
+    // Create a readline interface for basic line input
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      prompt: prompt
+    });
+    
+    // Display helpful instruction
+    rl.prompt();
+    
+    const cleanup = () => {
+      rl.close();
+      process.stdin.pause();
+    };
+    
+    const submitInput = () => {
+      cleanup();
+      const result = lines.join('\n').trim();
+      resolve(result);
+    };
+    
+    // Handle line input
+    rl.on('line', (input) => {
+      const now = Date.now();
+      const timeSinceLastInput = now - lastInputTime;
+      
+      // Check for double enter (quick succession)
+      if (enterPressed && timeSinceLastInput < DOUBLE_ENTER_THRESHOLD && input.trim() === '') {
+        // Double enter with empty line - submit
+        submitInput();
+        return;
+      }
+      
+      // Add the line to our collection
+      lines.push(input);
+      
+      // Check if this might be pasted multi-line content
+      if (input.includes('\n')) {
+        // This line contains newlines - likely from paste
+        // Split it properly and add all parts
+        const pastedLines = input.split('\n');
+        lines.pop(); // Remove the last entry we just added
+        lines.push(...pastedLines);
+        
+        // Display the pasted content properly
+        pastedLines.forEach((line, index) => {
+          if (index > 0) {
+            process.stdout.write('\n' + prompt + line);
+          }
+        });
+        
+        enterPressed = false; // Reset enter flag after paste
+      } else {
+        enterPressed = input.trim() === ''; // Mark if this was an empty line (just Enter)
+      }
+      
+      lastInputTime = now;
+      rl.prompt();
+    });
+    
+    // Handle Ctrl+D (EOF)
+    rl.on('close', () => {
+      if (lines.length > 0 || enterPressed) {
+        // User pressed Ctrl+D - submit what we have
+        const result = lines.join('\n').trim();
+        resolve(result);
+      } else {
+        // User pressed Ctrl+D with no input - return empty
+        resolve('');
+      }
+    });
+    
+    // Handle Ctrl+C
+    rl.on('SIGINT', () => {
+      cleanup();
+      process.stdout.write('\n');
+      process.exit();
+    });
+  });
+}
+
 /* ─────────────────────────  Generic Picker UI  ─────────────────────────── */
 /**
  * Factory function to create an interactive terminal picker UI.

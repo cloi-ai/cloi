@@ -1,31 +1,41 @@
 /**
- * Prompt Template for Classification Tasks
+ * Prompt Template for Error Type Classification
  * 
- * This module builds prompts for LLM-based classification of errors.
+ * This module builds prompts for classifying whether an error is a terminal command issue
+ * or a code file issue that needs patching.
  */
 
 /**
- * Creates a prompt for determining error type (terminal command or code issue)
+ * Creates a prompt for error type classification
  * 
- * @param {string} errorOutput - The error output to analyze
+ * @param {string} errorOutput - The raw error output from command execution
  * @param {string} analysis - Previous analysis of the error
- * @returns {string} - The formatted prompt
+ * @param {string} userContext - Optional user context for debugging focus
+ * @returns {string} - The formatted prompt for LLM
  */
-export function buildErrorTypePrompt(errorOutput, analysis) {
-  return `
-You are a binary classifier AI. Your ONLY task is to classify if a fix requires code changes or terminal commands.
+export function buildErrorTypePrompt(errorOutput, analysis, userContext = '') {
+  let prompt = `You are analyzing an error to determine if it's a terminal command issue or a code file issue.
+
+ERROR OUTPUT:
+${errorOutput}
 
 ANALYSIS:
-${analysis}
+${analysis}`;
 
-INSTRUCTIONS:
-1. Look at the Proposed Fix section
-2. If the fix requires running a command (like pip install, npm install, etc.), output: TERMINAL_COMMAND_ERROR
-3. If the fix requires changing code files, output: CODE_FILE_ISSUE
-4. You MUST output ONLY ONE of these exact phrases, and no additional thoughts: "TERMINAL_COMMAND_ERROR" or "CODE_FILE_ISSUE"
+  if (userContext) {
+    prompt += `
 
-Output ONLY ONE of these exact phrases. No need for long explanations. Just a simple single word output:
-'TERMINAL_COMMAND_ERROR',
-'CODE_FILE_ISSUE'
-`.trim();
+USER CONTEXT:
+${userContext}`;
+  }
+
+  prompt += `
+
+Classify this error as either:
+- TERMINAL_COMMAND_ERROR: Wrong command, missing dependencies, incorrect arguments, etc.
+- CODE_FILE_ISSUE: Bugs in the actual source code that need fixing
+
+Respond with exactly one of these two options and nothing else.`;
+
+  return prompt;
 } 

@@ -31,9 +31,10 @@ import fs from 'fs';
  * @param {string} [codeSummary=''] - Optional code summary
  * @param {string} [filePath=''] - Optional file path
  * @param {string} [optimizationSet='error_analysis'] - The optimization set to use
+ * @param {string} [userContext=''] - Optional user context for debugging focus
  * @returns {Promise<{analysis: string, reasoning: string, wasStreamed: boolean}>} - Analysis, reasoning and streaming flag
  */
-export async function analyzeWithLLM(errorOutput, model = 'phi4:latest', fileInfo = {}, codeSummary = '', filePath = '', optimizationSet = 'error_analysis') {
+export async function analyzeWithLLM(errorOutput, model = 'phi4:latest', fileInfo = {}, codeSummary = '', filePath = '', optimizationSet = 'error_analysis', userContext = '') {
   // Start thinking animation - use normal positioning to avoid spacing issues
   const stopThinking = startThinking(getThinkingPhrasesForAnalysis(), false);
   
@@ -68,8 +69,8 @@ export async function analyzeWithLLM(errorOutput, model = 'phi4:latest', fileInf
       }
     }
     
-    // Build the analysis prompt with enhanced context
-    const prompt = buildAnalysisPrompt(errorOutput, enhancedFileInfo, codeSummary, filePath, context);
+    // Build the analysis prompt with enhanced context and user input
+    const prompt = buildAnalysisPrompt(errorOutput, enhancedFileInfo, codeSummary, filePath, context, userContext);
     
     const max_tokens = 512; // Increased for RAG context
     
@@ -109,9 +110,10 @@ export async function analyzeWithLLM(errorOutput, model = 'phi4:latest', fileInf
  * @param {string} errorOutput - The error output
  * @param {string} analysis - Previous analysis of the error
  * @param {string} model - The model to use
+ * @param {string} [userContext=''] - Optional user context
  * @returns {Promise<string>} - Either "TERMINAL_COMMAND_ERROR" or "CODE_FILE_ISSUE"
  */
-export async function determineErrorType(errorOutput, analysis, model) {
+export async function determineErrorType(errorOutput, analysis, model, userContext = '') {
   // First do a quick check for obvious terminal errors
   if (isTerminalCommandError(errorOutput)) {
     return "TERMINAL_COMMAND_ERROR";
@@ -123,7 +125,7 @@ export async function determineErrorType(errorOutput, analysis, model) {
     await ensureModelAvailable(model);
     
     // Build the error type classification prompt
-    const prompt = buildErrorTypePrompt(errorOutput, analysis);
+    const prompt = buildErrorTypePrompt(errorOutput, analysis, userContext);
     
     const max_tokens = 32;
     
@@ -147,16 +149,17 @@ export async function determineErrorType(errorOutput, analysis, model) {
  * @param {string[]} prevCommands - Previous attempted commands
  * @param {string} analysis - Previous error analysis
  * @param {string} model - The model to use
+ * @param {string} [userContext=''] - Optional user context
  * @returns {Promise<{command: string, reasoning: string}>} - Generated command and reasoning
  */
-export async function generateTerminalCommandFix(prevCommands, analysis, model) {
+export async function generateTerminalCommandFix(prevCommands, analysis, model, userContext = '') {
   const stopThinking = startThinking(getThinkingPhrasesForAnalysis());
   
   try {
     await ensureModelAvailable(model);
     
     // Build the command fix prompt
-    const prompt = buildCommandFixPrompt(prevCommands, analysis);
+    const prompt = buildCommandFixPrompt(prevCommands, analysis, userContext);
     
     const max_tokens = 256;
     
@@ -199,6 +202,7 @@ export async function generateTerminalCommandFix(prevCommands, analysis, model) 
  * @param {string} model - The model to use
  * @param {Object} fileInfo - Optional file information
  * @param {string} codeSummary - Optional code summary
+ * @param {string} [userContext=''] - Optional user context
  * @returns {Promise<{diff: string, reasoning: string}>} - Generated diff and reasoning
  */
 export async function generatePatch(
@@ -208,7 +212,8 @@ export async function generatePatch(
   currentDir = process.cwd(),
   model,
   fileInfo = {},
-  codeSummary = ''
+  codeSummary = '',
+  userContext = ''
 ) {
   const stopThinking = startThinking(getThinkingPhrasesForPatch());
   
@@ -276,7 +281,7 @@ export async function generatePatch(
       // Silently ignore issues with reading RAG files
     }
     
-    // Build the patch prompt
+    // Build the patch prompt with user context
     const prompt = buildPatchPrompt(
       errorOutput,
       prevPatches,
@@ -288,7 +293,8 @@ export async function generatePatch(
       errorLines,
       exactErrorCode,
       context,
-      ragFiles
+      ragFiles,
+      userContext
     );
 
     // Display the prompt for debugging purposes
@@ -387,16 +393,17 @@ export async function generatePatch(
  * Summarizes code content with an LLM
  * @param {string} codeContent - The code content to summarize
  * @param {string} model - The model to use
+ * @param {string} [userContext=''] - Optional user context
  * @returns {Promise<{summary: string, wasStreamed: boolean}>} - The summary and streaming flag
  */
-export async function summarizeCodeWithLLM(codeContent, model) {
+export async function summarizeCodeWithLLM(codeContent, model, userContext = '') {
   const stopThinking = startThinking(getThinkingPhrasesForSummarization());
   
   try {
     await ensureModelAvailable(model);
     
     // Build the summary prompt
-    const prompt = buildSummaryPrompt(codeContent);
+    const prompt = buildSummaryPrompt(codeContent, userContext);
     
     const max_tokens = 128;
     

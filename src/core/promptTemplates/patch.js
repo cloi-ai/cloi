@@ -5,19 +5,20 @@
  */
 
 /**
- * Creates a prompt for generating a code fix patch
+ * Creates a prompt for generating code patches
  * 
  * @param {string} errorOutput - The error output
  * @param {string[]} prevPatches - Previous attempted patches
  * @param {string} analysis - Previous error analysis
  * @param {string} currentDir - Current working directory
- * @param {Object} fileInfo - Optional file information
- * @param {string} codeSummary - Optional code summary
- * @param {string} errorFiles - Files containing errors
- * @param {string} errorLines - Line numbers with errors
- * @param {string} exactErrorCode - Exact code with errors
- * @param {string} context - Error context
- * @param {Array<Object>} ragFiles - Array of RAG file objects with { path, startLine, endLine, content }
+ * @param {Object} fileInfo - File information context
+ * @param {string} codeSummary - Code summary
+ * @param {string} errorFiles - Files with errors
+ * @param {string} errorLines - Lines with errors
+ * @param {string} exactErrorCode - Exact error code lines
+ * @param {string} context - Traceback context
+ * @param {Array} ragFiles - RAG enhanced file information
+ * @param {string} userContext - Optional user context for debugging focus
  * @returns {string} - The formatted prompt
  */
 export function buildPatchPrompt(
@@ -25,106 +26,111 @@ export function buildPatchPrompt(
   prevPatches, 
   analysis, 
   currentDir, 
-  fileInfo = {}, 
-  codeSummary = '',
-  errorFiles = '',
-  errorLines = '',
-  exactErrorCode = '',
-  context = '',
-  ragFiles = []
+  fileInfo, 
+  codeSummary, 
+  errorFiles, 
+  errorLines, 
+  exactErrorCode, 
+  context,
+  ragFiles = [],
+  userContext = ''
 ) {
-  const prevPatchesText = prevPatches.length
-    ? `\n\nPreviously attempted patches:\n${prevPatches.join('\n\n')}`
-    : '';
+  let promptParts = [
+    'You are an expert code fixer. Your job is to generate a unified diff patch that fixes the error.',
+    '',
+    'ERROR OUTPUT:',
+    errorOutput,
+  ];
 
-  // Format file content info for the prompt
-  const fileContentInfo = fileInfo && (fileInfo.withLineNumbers || fileInfo.content)
-    ? `File Content (lines ${fileInfo.start || 1}-${fileInfo.end || '?'}):\n${fileInfo.withLineNumbers || fileInfo.content}\n` 
-    : '';
-
-  // Format RAG context info for the prompt
-  let ragContextInfo = '';
-  if (fileInfo && fileInfo.ragContext) {
-    if (fileInfo.ragRootCause) {
-      ragContextInfo += `RAG Root Cause Analysis:\n${fileInfo.ragRootCause}\n\n`;
-    }
-    if (fileInfo.ragRelatedFiles) {
-      ragContextInfo += `RAG Related Files:\n${fileInfo.ragRelatedFiles}\n\n`;
-    }
-    if (fileInfo.ragEnhancedContent) {
-      ragContextInfo += `RAG Enhanced Context:\n${fileInfo.ragEnhancedContent}\n\n`;
-    }
+  // Add user context early in the prompt if provided
+  if (userContext) {
+    promptParts.push('', 'USER CONTEXT:', userContext);
   }
 
-  // Format RAG files and their contents
-  let ragFilesInfo = '';
+  promptParts.push(
+    '',
+    'ANALYSIS:',
+    analysis,
+    '',
+    'CURRENT DIRECTORY:',
+    currentDir,
+  );
+
+  // Add code summary if available
+  if (codeSummary) {
+    promptParts.push('', 'CODE SUMMARY:', codeSummary);
+  }
+
+  // Add file content if available
+  if (fileInfo && (fileInfo.withLineNumbers || fileInfo.content)) {
+    const content = fileInfo.withLineNumbers || fileInfo.content || '';
+    const start = fileInfo.start || 1;
+    const end = fileInfo.end || (content ? content.split('\n').length : 1);
+    promptParts.push('', `FILE CONTENT (lines ${start}-${end}):`, content);
+  }
+
+  // Add error context
+  if (errorFiles) {
+    promptParts.push('', 'ERROR FILES:', errorFiles);
+  }
+
+  if (errorLines) {
+    promptParts.push('', 'ERROR LINES:', errorLines);
+  }
+
+  if (exactErrorCode) {
+    promptParts.push('', 'EXACT ERROR CODE:', exactErrorCode);
+  }
+
+  if (context) {
+    promptParts.push('', 'TRACEBACK CONTEXT:', context);
+  }
+
+  // Add RAG files if available
   if (ragFiles && ragFiles.length > 0) {
-    ragFilesInfo = 'RAG Retrieved Files and Contents:\n';
+    promptParts.push('', 'RAG ENHANCED FILES:');
     ragFiles.forEach(file => {
-      ragFilesInfo += `- File: ${file.path} (lines ${file.startLine}-${file.endLine})\n`;
-      ragFilesInfo += `  Content:\n${file.content}\n\n`;
+      promptParts.push(`--- ${file.path} (lines ${file.startLine}-${file.endLine}) ---`);
+      promptParts.push(file.content);
+      promptParts.push('');
     });
   }
 
-  return `
-Analyze the error and generate a structured patch in JSON format with the following schema:
-{
-  "changes": [
-    {
-      "file_path": "relative/path/to/file.py",
-      "line_number": 42,
-      "old_line": "    z = x + yy",
-      "new_line": "    z = x + y"
-    },
-    ...
-  ]
-}
+  // Add previous patches if any
+  if (prevPatches && prevPatches.length > 0) {
+    promptParts.push('', 'PREVIOUS PATCHES (these failed):', prevPatches.join('\n'));
+  }
 
-Error Analysis:
-${analysis}
+  // Add instructions
+  promptParts.push(
+    '',
+    'INSTRUCTIONS:',
+    'Generate a unified diff patch that fixes the error. The patch must be in standard unified diff format:',
+    '',
+    '--- a/path/to/file.py',
+    '+++ b/path/to/file.py',
+    '@@ -line_start,line_count +line_start,line_count @@',
+    ' unchanged line',
+    '-line to remove',
+    '+line to add',
+    ' unchanged line',
+    '',
+    'Requirements:',
+    '1. Use relative paths from the current directory',
+    '2. Include sufficient context lines (unchanged lines around changes)',
+    '3. Make minimal, targeted changes',
+    '4. Ensure the fix directly addresses the error',
+  );
 
-Current Working Directory:
-${currentDir}
+  // Add user context focus if provided
+  if (userContext) {
+    promptParts.push(`5. Pay special attention to the user's concern: "${userContext}"`);
+  }
 
-${codeSummary ? `Code Summary:\n${codeSummary}\n` : ''}
-${fileContentInfo}
-${ragContextInfo}
-${ragFilesInfo}
-Error File:
-${errorFiles || '(none)'}
+  promptParts.push(
+    '',
+    'Generate ONLY the unified diff patch. No explanations or additional text.',
+  );
 
-Error Line:
-${errorLines || '(none)'}
-
-Error Code:
-${exactErrorCode || '(none)'}
-
-Code Context (±3 lines from error locations):
-${context || '(none)'}
-
-Previous Patches:
-${prevPatchesText || '(none)'}
-
-Instructions:
-1. Ensure the file_path is relative to: ${currentDir}
-2. Include the ENTIRE line for both old_line and new_line
-3. For deletions, include old_line but set new_line to null
-4. For additions, set line_number of the line that comes before and set old_line to ""
-5. The line_number should correspond to the line number in the original file
-
-IMPORTANT: PRESERVE EXACT INDENTATION
-- Python code relies on proper indentation for correct execution
-- Do not change indentation levels unless that's specifically part of the fix
-- Each space and tab matters in the generated patch
-- Copy the exact whitespace from the beginning of each line
-- Ensure that relative indentation between lines remains consistent
-
-Make sure to:
-1. Only include lines that are actually changed
-2. Use the correct line numbers from the error traceback (line ${errorLines || '?'})
-3. Keep the changes as minimal as possible
-4. Return ONLY valid JSON with no explanations or extra text
-
-Return ONLY the JSON object with no additional text or code blocks.
-`.trim();
+  return promptParts.join('\n');
 } 

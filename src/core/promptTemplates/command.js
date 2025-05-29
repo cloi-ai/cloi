@@ -1,38 +1,57 @@
 /**
  * Prompt Template for Terminal Command Generation
  * 
- * This module builds prompts for LLM-based terminal command generation.
+ * This module builds prompts for generating terminal commands to fix errors.
  */
 
 /**
- * Creates a prompt for generating a terminal command fix
+ * Creates a prompt for generating terminal command fixes
  * 
- * @param {string[]} prevCommands - Previous attempted fix commands
- * @param {string} analysis - Previous error analysis
+ * @param {string[]} prevCommands - Previous attempted commands (if any)
+ * @param {string} analysis - Analysis of the error
+ * @param {string} userContext - Optional user context for debugging focus
  * @returns {string} - The formatted prompt
  */
-export function buildCommandFixPrompt(prevCommands, analysis) {
-  const prevCommandsText = Array.isArray(prevCommands) && prevCommands.length > 0
-    ? `\n\nPreviously tried commands:\n${prevCommands.map(cmd => `- ${cmd}`).join('\n')}`
-    : '(none)';
+export function buildCommandFixPrompt(prevCommands, analysis, userContext = '') {
+  let prompt = `You are a terminal command expert. Generate a single command to fix this error.
 
-  return `
-You are a terminal command fixing AI. Given an analysis, extract a new command to fix it.
+ANALYSIS:
+${analysis}`;
 
-Error Analysis:
-${analysis}
+  if (userContext) {
+    prompt += `
 
-Previous Commands:
-${prevCommandsText}
+USER CONTEXT:
+${userContext}`;
+  }
 
-Instructions:
-1. Analyze the Proposed Fix section carefully
-2. Extract a single command that will fix the issue
-3. The command should be complete and ready to run
-4. Do not include any explanations, commentary, or markdown formatting
-5. Only output the command itself
+  if (prevCommands && prevCommands.length > 0) {
+    prompt += `
 
-Generate ONLY the command, nothing else. No explanations, no markdown, just the raw command.
-Make sure it's valid syntax that can be directly executed in a terminal.
-`.trim();
+PREVIOUS ATTEMPTS (these failed):
+${prevCommands.join('\n')}`;
+  }
+
+  prompt += `
+
+Generate ONE terminal command that will fix this issue. Examples:
+- pip install requests
+- npm install express
+- sudo apt update && sudo apt install python3-dev
+
+Requirements:
+1. Output ONLY the command, no explanations
+2. Make it runnable as-is
+3. Don't include $ or prompt symbols`;
+
+  if (userContext) {
+    prompt += `
+4. Consider the user's specific concern: "${userContext}"`;
+  }
+
+  prompt += `
+
+Command:`;
+
+  return prompt;
 } 

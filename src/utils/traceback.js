@@ -25,68 +25,178 @@ import path from 'path';
  * @returns {boolean} - True if the path seems to be user code.
  */
 export function isUserFile(p) {
-  // If path doesn't exist or isn't a file, it's not a user file
-  if (!existsSync(p)) {
-    return false;
-  }
+  // If path doesn't exist or isn't a file, check if it could be a user file anyway
+  // (sometimes error messages reference files before they're created)
+  let shouldCheckExistence = true;
   
   try {
     // Get absolute path and normalize it
-    const absolutePath = path.resolve(p);
+    let absolutePath;
+    try {
+      absolutePath = path.resolve(p);
+    } catch (error) {
+      // If path resolution fails, use the original path
+      absolutePath = p;
+      shouldCheckExistence = false;
+    }
     
     // Directories to skip (common system/package locations)
     const skip = [
       // Python
-      'site-packages', 'dist-packages', 'lib/python',
+      'site-packages', 'dist-packages', 'lib/python', '__pycache__',
       // JavaScript/Node.js
-      'node_modules', 'npm', 'yarn',
-      // System paths
+      'node_modules', 'npm', 'yarn', '.npm', '.yarn',
+      // System paths (Unix/Linux/macOS)
       '/usr/lib/', '/usr/local/lib/', '/var/lib/', '/opt/',
       '/Library/Frameworks/', '/System/', '/Applications/',
-      // Special paths
-      '<frozen', '<string>', '__pycache__', '<__array_function__>',
-      // Common package managers
-      '.nvm/', '.cargo/', '.gem/', '.conda/',
+      '/usr/bin/', '/usr/local/bin/', '/bin/', '/sbin/',
+      // Common package managers and tools
+      '.nvm/', '.cargo/', '.gem/', '.conda/', '.pip/',
       // Ruby
-      'gems/', 'ruby/gems',
+      'gems/', 'ruby/gems', '.rvm/',
       // Java
-      'jre/', 'jdk/', '.m2/', 'gradle/',
+      'jre/', 'jdk/', '.m2/', 'gradle/', '.gradle/',
       // Go
-      'go/pkg/', '.go/pkg/',
+      'go/pkg/', '.go/pkg/', 'GOPATH/', 'GOROOT/',
       // Rust
-      '.rustup/', 'cargo/registry/'
+      '.rustup/', 'cargo/registry/',
+      // Package managers
+      '.cache/', 'cache/', 'Cache/',
+      // Special paths that aren't real files
+      '<frozen', '<string>', '<__array_function__>', '<stdin>', '<stdout>',
+      // Common virtual/temporary locations
+      '/tmp/', '/temp/', 'tmp/', 'temp/',
+      // Editor and IDE files
+      '.vscode/', '.idea/', '.vs/',
+      // Version control
+      '.git/', '.svn/', '.hg/',
+      // Build directories
+      'build/', 'dist/', 'target/', 'out/', 'bin/', 'obj/',
+      // Package lock files and configs that aren't user code
+      'package-lock.json', 'yarn.lock', 'composer.lock'
     ];
     
     const low = absolutePath.toLowerCase();
     
     // Check if the path contains any of the skip directories
-    if (skip.some(dir => low.includes(dir.toLowerCase()))) {
+    if (skip.some(dir => {
+      const skipLower = dir.toLowerCase();
+      return low.includes(skipLower) || 
+             low.includes('/' + skipLower) || 
+             low.endsWith('/' + skipLower.replace('/', ''));
+    })) {
       return false;
     }
     
-    // Check if it's in current working directory or subdirectory
-    const cwd = process.cwd();
-    if (absolutePath.startsWith(cwd)) {
-      return true;
-    }
-    
-    // Check if it's a common temp directory
-    if (low.includes('/tmp/') || low.includes('/temp/')) {
-      return false;
-    }
-    
-    // Check if the file has a standard code extension
-    const codeExtensions = [
-      '.js', '.py', '.rb', '.java', '.c', '.cpp', '.go', '.rs',
-      '.php', '.html', '.css', '.sh', '.json', '.yaml', '.yml',
-      '.jsx', '.tsx', '.ts', '.md', '.txt'
+    // Skip files that look like internal or generated files
+    const filename = path.basename(absolutePath).toLowerCase();
+    const skipFilenames = [
+      // Internal files
+      '__init__.py', '__main__.py', '__pycache__',
+      // Lock/cache files
+      '.ds_store', 'thumbs.db', 
+      // Build artifacts
+      'bundle.js', 'bundle.min.js',
+      // Log files
+      '.log', 'error.log', 'access.log'
     ];
     
-    return codeExtensions.some(ext => low.endsWith(ext));
+    if (skipFilenames.some(skip => filename.includes(skip))) {
+      return false;
+    }
+    
+    // Check file extension - expand to include more user file types
+    const codeExtensions = [
+      // Programming languages
+      '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
+      '.py', '.pyx', '.pyi', '.ipynb',
+      '.rb', '.rbw', '.rake',
+      '.java', '.scala', '.kt', '.groovy',
+      '.c', '.h', '.cpp', '.cc', '.cxx', '.hpp',
+      '.go', '.rs', '.zig',
+      '.php', '.phtml',
+      '.swift', '.m', '.mm',
+      '.dart', '.r', '.jl',
+      // Web technologies
+      '.html', '.htm', '.css', '.scss', '.sass', '.less',
+      '.vue', '.svelte', '.astro',
+      // Configuration and data
+      '.json', '.jsonc', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+      '.xml', '.plist',
+      // Scripts and shell
+      '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd',
+      // Documentation and text
+      '.md', '.mdx', '.rst', '.txt', '.rtf',
+      // Database and query
+      '.sql', '.graphql', '.gql',
+      // Other common user files
+      '.env', '.properties', '.gitignore', '.dockerignore',
+      'Dockerfile', 'Makefile', 'Rakefile', 'Gemfile', 'requirements.txt'
+    ];
+    
+    const hasCodeExtension = codeExtensions.some(ext => {
+      return low.endsWith(ext.toLowerCase()) || 
+             filename === ext.substring(1); // Handle files like "Dockerfile"
+    });
+    
+    if (!hasCodeExtension) {
+      return false;
+    }
+    
+    // If we should check existence and the file doesn't exist, it might still be relevant
+    // (e.g., import errors referencing missing files in user space)
+    if (shouldCheckExistence && !existsSync(absolutePath)) {
+      // If it's in a path that looks like user space, consider it valid
+      const cwd = process.cwd();
+      const userHome = require('os').homedir();
+      
+      // Check if it's in current working directory tree or user home tree (but not system areas)
+      if (absolutePath.startsWith(cwd) || 
+          (absolutePath.startsWith(userHome) && 
+           !absolutePath.includes('/Library/') && 
+           !absolutePath.includes('/.cache/') &&
+           !absolutePath.includes('/node_modules/'))) {
+        return true;
+      }
+      
+      return false;
+    }
+    
+    // If file exists, check if it's in a user-controlled location
+    if (shouldCheckExistence) {
+      const cwd = process.cwd();
+      const userHome = require('os').homedir();
+      
+      // Check if it's in current working directory or subdirectory
+      if (absolutePath.startsWith(cwd)) {
+        return true;
+      }
+      
+      // Check if it's in user home directory (but not in system areas)
+      if (absolutePath.startsWith(userHome)) {
+        // Exclude common system areas in user home
+        const userSystemPaths = [
+          '/Library/', '/.cache/', '/.npm/', '/.yarn/', '/.cargo/',
+          '/.conda/', '/.gem/', '/.pip/', '/.rustup/', '/.nvm/'
+        ];
+        
+        const relativePath = absolutePath.substring(userHome.length);
+        if (!userSystemPaths.some(sysPath => relativePath.startsWith(sysPath))) {
+          return true;
+        }
+      }
+    }
+    
+    return hasCodeExtension;
     
   } catch (error) {
-    // If any error occurs during the checks, assume it's not a user file
-    return false;
+    // If any error occurs during the checks, be conservative
+    // but still allow files with obvious code extensions
+    const filename = path.basename(p).toLowerCase();
+    return filename.endsWith('.js') || filename.endsWith('.py') || 
+           filename.endsWith('.ts') || filename.endsWith('.jsx') ||
+           filename.endsWith('.tsx') || filename.endsWith('.vue') ||
+           filename.endsWith('.java') || filename.endsWith('.rb');
   }
 }
 
@@ -102,70 +212,105 @@ export function extractFilesFromTraceback(log) {
   
   // Pattern matchers for different programming language traceback formats
   const patterns = [
-    // Python-style traceback: File "path", line number
-    { regex: /File \"([^\"]+)\", line (\d+)/g, fileGroup: 1, lineGroup: 2 },
+    // Traditional traceback patterns (highest priority)
+    { regex: /File \"([^\"]+)\", line (\d+)/g, fileGroup: 1, lineGroup: 2, priority: 1 },
+    { regex: /at\s+(?:\w+\s+)?\(?([^()\s]+):(\d+)(?::\d+)?\)?/g, fileGroup: 1, lineGroup: 2, priority: 1 },
+    { regex: /([^:\s]+):(\d+):in/g, fileGroup: 1, lineGroup: 2, priority: 1 },
+    { regex: /([^:\s]+):(\d+)\s+\+0x[a-f0-9]+/g, fileGroup: 1, lineGroup: 2, priority: 1 },
+    { regex: /at\s+[\w$.]+\(([^:)]+):(\d+)\)/g, fileGroup: 1, lineGroup: 2, priority: 1 },
+    { regex: /\b((?:\/[^\/\s:]+)+\.[a-zA-Z0-9]+):(\d+)/g, fileGroup: 1, lineGroup: 2, priority: 1 },
     
-    // JavaScript/Node.js traceback: at module (path:line:column)
-    { regex: /at\s+(?:\w+\s+)?\(?([^()\s]+):(\d+)(?::\d+)?\)?/g, fileGroup: 1, lineGroup: 2 },
+    // File URLs (medium priority)
+    { regex: /file:\/\/\/([^?\s'"]+\.[a-zA-Z0-9]+)/g, fileGroup: 1, lineGroup: -1, priority: 2 },
     
-    // Ruby-style traceback: path:line:in `method'
-    { regex: /([^:\s]+):(\d+):in/g, fileGroup: 1, lineGroup: 2 },
+    // Error/warning messages with file mentions (lower priority)
+    { regex: /(?:Error|Warning|Notice)[^:]*:\s*[^]*?([A-Za-z]:?[\/\\][^?\s:;,'"()<>]+\.[a-zA-Z0-9]+)/g, fileGroup: 1, lineGroup: -1, priority: 3 },
     
-    // Golang-style traceback: path:line +0xabcdef
-    { regex: /([^:\s]+):(\d+)\s+\+0x[a-f0-9]+/g, fileGroup: 1, lineGroup: 2 },
+    // Module errors
+    { regex: /(?:Cannot\s+(?:find|resolve)|Module\s+[^\/]*|Failed\s+to\s+[^\/]*)\s+(?:module\s+)?['"`]?([^'"`\s:;,()]+\.[a-zA-Z0-9]+)['"`]?/g, fileGroup: 1, lineGroup: -1, priority: 4 },
     
-    // Java/JVM-style traceback: at package.Class.method(Class.java:line)
-    { regex: /at\s+[\w$.]+\(([^:)]+):(\d+)\)/g, fileGroup: 1, lineGroup: 2 },
-    
-    // Generic path:line pattern that might appear in various errors
-    { regex: /\b((?:\/[^\/\s:]+)+\.[a-zA-Z0-9]+):(\d+)/g, fileGroup: 1, lineGroup: 2 }
+    // Files in parentheses
+    { regex: /\(([^()\s:;,'"]+\.[a-zA-Z0-9]+)\)/g, fileGroup: 1, lineGroup: -1, priority: 5 }
   ];
   
-  // Collect frames for each pattern
+  // Collect frames for each pattern with priority
   const allFrames = [];
   
   for (const pattern of patterns) {
     let match;
-    const { regex, fileGroup, lineGroup } = pattern;
+    const { regex, fileGroup, lineGroup, priority } = pattern;
     
-    // Reset the regex for each iteration
     regex.lastIndex = 0;
     
     while ((match = regex.exec(log)) !== null) {
-      const file = match[fileGroup];
-      const line = parseInt(match[lineGroup], 10);
+      let file = match[fileGroup];
+      let line = 1;
       
-      // Skip if we couldn't parse the line number
-      if (isNaN(line)) continue;
+      // Clean up file URLs
+      if (file.startsWith('file:///')) {
+        file = file.replace(/^file:\/\/\//, '/');
+      }
       
-      // Store position in the log to determine depth in stack trace
-      allFrames.push({ file, line, position: match.index });
+      // Normalize path separators
+      file = file.replace(/\\/g, '/');
+      
+      // Parse line number if available
+      if (lineGroup > 0) {
+        line = parseInt(match[lineGroup], 10);
+        if (isNaN(line)) continue;
+      }
+      
+      allFrames.push({ 
+        file: file, 
+        line: line, 
+        position: match.index, 
+        priority: priority,
+        originalMatch: match[0] 
+      });
     }
   }
   
-  // Sort by position in the trace (deeper frames appear first in the trace)
-  allFrames.sort((a, b) => a.position - b.position);
-  
-  // Filter to user files only
-  const userFrames = allFrames.filter(frame => isUserFile(frame.file));
-  
-  // If we have user frames, process them to get the deepest frame for each file
-  if (userFrames.length > 0) {
-    // Group by file path
-    const fileGroups = {};
-    for (const frame of userFrames) {
-      if (!fileGroups[frame.file]) {
-        fileGroups[frame.file] = [];
-      }
-      fileGroups[frame.file].push(frame);
+  // Sort by priority first, then by position
+  allFrames.sort((a, b) => {
+    if (a.priority !== b.priority) {
+      return a.priority - b.priority;
     }
-    
-    // For each file, get the deepest frame (last in the stack trace)
-    for (const file in fileGroups) {
-      const frames = fileGroups[file];
-      // The last frame in the group is typically the actual error line
-      const deepestFrame = frames[frames.length - 1];
-      result.set(file, deepestFrame.line);
+    return a.position - b.position;
+  });
+  
+  // Filter to user files and deduplicate
+  const seenFiles = new Set();
+  const seenBasePaths = new Map(); // Track basename + parent directory combinations
+  
+  for (const frame of allFrames) {
+    if (isUserFile(frame.file)) {
+      // Create a normalized key for deduplication
+      let normalizedPath = frame.file;
+      
+      // Try to resolve to absolute path for deduplication
+      try {
+        if (path.isAbsolute(normalizedPath)) {
+          normalizedPath = path.normalize(normalizedPath);
+        } else {
+          normalizedPath = path.resolve(normalizedPath);
+        }
+      } catch (error) {
+        // Keep original if normalization fails
+      }
+      
+      // Create a deduplication key based on basename and parent directory
+      const basename = path.basename(normalizedPath);
+      const parentDir = path.basename(path.dirname(normalizedPath));
+      const dedupeKey = `${parentDir}/${basename}`;
+      
+      // Check if we've already seen this basename + parent directory combination
+      if (!seenBasePaths.has(dedupeKey)) {
+        seenBasePaths.set(dedupeKey, normalizedPath);
+        result.set(normalizedPath, frame.line);
+        
+        // For the main file we want, take the first valid match and stop
+        if (result.size >= 3) break; // Limit to avoid too many false positives
+      }
     }
   }
   

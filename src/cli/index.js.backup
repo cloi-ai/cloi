@@ -153,7 +153,7 @@ async function interactiveLoop(initialCmd, limit, initialModel, errorInfo = null
           const fileNames = Array.from(errorFiles).map(file => path.basename(file));
           const filesText = fileNames.join(', ');
           console.log(chalk.gray('  Describe the error, list files, and I\'ll go ahead and debug it for you.'));
-          console.log(chalk.gray(`  I see that you ran into an error in: ${chalk.blueBright(filesText)} | Press Enter twice to submit`));
+          console.log(chalk.gray(`  I see that you ran into an error in: ${chalk.blueBright(filesText)}`));
         } else {
           console.log(chalk.gray('  Describe the error, list files, and I\'ll go ahead and debug it for you.'));
         }
@@ -165,7 +165,38 @@ async function interactiveLoop(initialCmd, limit, initialModel, errorInfo = null
         console.log(chalk.gray('  Run /debug to auto-fix the last command, or ctrl+c when you\'re done.'));
       }
   
-      const input = await askMultiLineInput('> ');
+      let input = '';
+      let isAccumulatingInput = false;
+      
+      // Function to get input, handling potential multi-line paste scenarios
+      const getCompleteInput = async () => {
+        const singleInput = await askMultiLineInput('> ');
+        
+        // If input looks incomplete (no clear command and seems like it might be cut off)
+        // and it's not empty, ask for more
+        if (singleInput && !singleInput.match(/^\/\w+/) && singleInput.length > 20 && 
+            singleInput.trim().endsWith('.') === false) {
+          
+          isAccumulatingInput = true;
+          let accumulatedInput = singleInput;
+          
+          console.log(chalk.gray('  (Looks like multi-line input, press Enter on empty line to finish)'));
+          
+          while (true) {
+            const nextLine = await askMultiLineInput('... ');
+            if (nextLine.trim() === '') {
+              break; // Empty line means done
+            }
+            accumulatedInput += '\n' + nextLine;
+          }
+          
+          return accumulatedInput;
+        }
+        
+        return singleInput;
+      };
+      
+      input = await getCompleteInput();
       
       // Handle multi-line input: if input contains newlines, treat the whole thing as conversational input
       // unless the first line is clearly a command
@@ -278,6 +309,11 @@ async function interactiveLoop(initialCmd, limit, initialModel, errorInfo = null
           // Handle multi-line input or conversational input
           if ((errorInfo && input.length > 0) || isMultiLine) {
             process.stdout.write('\n');
+            if (isMultiLine) {
+              console.log(chalk.gray(`  I see you pasted multi-line content. Let me help you with that.`));
+            } else {
+              console.log(chalk.gray(`  Got it! I'll focus on: "${input}"`));
+            }
             console.log(); // Add spacing
             
             // Start conversational debugging with user input as context
@@ -1797,6 +1833,12 @@ async function conversationalDebugLoop(initialCmd, limit, currentModel, errorInf
         console.log(chalk.gray('  No worries, I\'ll work with what I have!'));
         userContext = '';
       }
+    }
+    
+    if (userContext) {
+      console.log(chalk.gray(`  Perfect! I'll focus on: "${userContext}"`));
+    } else {
+      console.log(chalk.gray('  No problem, I\'ll do a general analysis!'));
     }
     
     console.log(); // Add spacing
