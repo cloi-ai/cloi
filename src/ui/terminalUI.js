@@ -192,7 +192,7 @@ export async function askMultiLineInput(prompt = '> ') {
     let lastInputTime = 0;
     let enterPressed = false;
     
-    const DOUBLE_ENTER_THRESHOLD = 800; // ms for double-enter detection (increased from 500ms)
+    const DOUBLE_ENTER_THRESHOLD = 1000; // ms for double-enter detection (increased from 500ms)
     
     // Create a readline interface for basic line input
     const rl = readline.createInterface({
