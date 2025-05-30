@@ -33,6 +33,7 @@
         "chalk": "^5.4.1",
         "faiss-node": "^0.5.1",
         "ollama": "0.5.15",
+        "puppeteer": "^24.8.2",
         "seedrandom": "^3.0.5",
         "yargs": "^17.7.2"
     },

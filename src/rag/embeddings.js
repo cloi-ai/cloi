@@ -241,73 +241,49 @@ export async function initializeCodeModel() {
  * @returns {Promise<Float32Array>} The embedding vector as Float32Array
  */
 export async function generateEmbedding(codeChunk) {
-  try {
-    // Ensure model is initialized
-    const { model } = await initializeCodeModel();
-    
-    if (!model) {
-      throw new Error('CodeBERT model not initialized');
-    }
-
-    // Preprocess and truncate code for the model
-    const processedCode = preprocessCodeForCodeBERT(codeChunk);
-    const truncatedCode = processedCode.length > MAX_LENGTH * 4 ? 
-      processedCode.substring(0, MAX_LENGTH * 4) : processedCode;
-
-    // Generate embedding with error handling
-    try {
-    
-      const output = await model(truncatedCode);
-      
-      // Extract embedding array from whatever format the model returned
-      let embedding;
-      
-      if (Array.isArray(output) && output[0] && output[0].values instanceof Float32Array) {
-        // Model returns the expected format directly
-        embedding = Array.from(output[0].values);
-      } else if (output && output.embedding && Array.isArray(output.embedding)) {
-        // Output is from our Python service
-        embedding = output.embedding;
-      } else {
-        // We need to extract and process the embedding
-        embedding = extractEmbeddingFromOutput(output);
-      }
-
-      // Ensure it's an array of numbers with the right dimension
-      if (!Array.isArray(embedding)) {
-        console.error('Invalid embedding format, not an array:', typeof embedding);
-        embedding = new Array(EMBEDDING_DIMENSION).fill(0.1);
-      }
-
-      const numericEmbedding = embedding.map(val => Number(val));
-      
-      // Validate embedding dimension
-      if (numericEmbedding.length !== EMBEDDING_DIMENSION) {
-        console.warn(`Embedding dimension mismatch: expected ${EMBEDDING_DIMENSION}, got ${numericEmbedding.length}`);
-        // Pad or truncate to correct dimension
-        if (numericEmbedding.length < EMBEDDING_DIMENSION) {
-          numericEmbedding.push(...new Array(EMBEDDING_DIMENSION - numericEmbedding.length).fill(0.1));
-        } else {
-          numericEmbedding.splice(EMBEDDING_DIMENSION);
-        }
-      }
-
-      // Log success
+  // Ensure model is initialized
+  const { model } = await initializeCodeModel();
   
-      
-      // Return as Float32Array for consistency with FAISS expectations
-      return new Float32Array(numericEmbedding);
-    } catch (error) {
-      console.error(`Error in embedding generation: ${error.message}`);
-      
-      // Return a fallback embedding with the correct dimensionality as Float32Array
-      console.warn('Using fallback embedding due to error');
-      return new Float32Array(new Array(EMBEDDING_DIMENSION).fill(0.1));
-    }
-  } catch (error) {
-    console.error('Critical error in embedding pipeline:', error);
-    throw new Error(`Failed to generate embedding: ${error.message}`);
+  if (!model) {
+    throw new Error('CodeBERT model not initialized');
   }
+
+  // Preprocess and truncate code for the model
+  const processedCode = preprocessCodeForCodeBERT(codeChunk);
+  const truncatedCode = processedCode.length > MAX_LENGTH * 4 ? 
+    processedCode.substring(0, MAX_LENGTH * 4) : processedCode;
+
+  // Generate embedding with no fallbacks
+  const output = await model(truncatedCode);
+  
+  // Extract embedding array - only accept the proper format
+  let embedding;
+  
+  if (Array.isArray(output) && output[0] && output[0].values instanceof Float32Array) {
+    // Model returns the expected format directly
+    embedding = Array.from(output[0].values);
+  } else if (output && output.embedding && Array.isArray(output.embedding)) {
+    // Output is from our Python service
+    embedding = output.embedding;
+  } else {
+    // No fallbacks - if we don't get the expected format, throw an error
+    throw new Error('CodeBERT returned unexpected output format');
+  }
+
+  // Ensure it's an array of numbers with the right dimension
+  if (!Array.isArray(embedding)) {
+    throw new Error('Invalid embedding format, not an array');
+  }
+
+  const numericEmbedding = embedding.map(val => Number(val));
+  
+  // Validate embedding dimension
+  if (numericEmbedding.length !== EMBEDDING_DIMENSION) {
+    throw new Error(`Embedding dimension mismatch: expected ${EMBEDDING_DIMENSION}, got ${numericEmbedding.length}`);
+  }
+
+  // Return as Float32Array for consistency with FAISS expectations
+  return new Float32Array(numericEmbedding);
 }
 
 /**

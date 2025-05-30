@@ -12,6 +12,7 @@
 import { execSync } from 'child_process';
 import { promises as fs } from 'fs';
 import { join, dirname } from 'path';
+import chalk from 'chalk';
 
 /* ───────────────────────── Synchronous Command Execution ────────────────────────────── */
 /**
@@ -21,12 +22,107 @@ import { join, dirname } from 'path';
  * @param {number} [timeout=10000] - Timeout in milliseconds.
  * @returns {{ok: boolean, output: string}} - An object indicating success and the combined output.
  */
-export function runCommand(cmd, timeout = 10000) {
+/**
+ * Run a command with improved timeout handling
+ * @param {string} cmd - Command to run
+ * @param {number} timeout - Timeout in milliseconds (default: 5000)
+ * @param {boolean} captureTimeoutAsError - If true, treat timeout as an error condition
+ * @returns {Object} Result with ok status, output, and timedOut flag
+ */
+export function runCommand(cmd, timeout = 5000, captureTimeoutAsError = true) {
   try {
+    // For commands that might run indefinitely, we use a different approach
+    const indefiniteCommands = [
+      'npm start', 'npm run dev', 'npm run serve',
+      'yarn start', 'yarn dev', 'yarn serve',
+      'node server', 'python app.py', 'flask run',
+      'ng serve', 'react-scripts start'
+    ];
+    
+    const isLikelyIndefinite = indefiniteCommands.some(pattern => 
+      cmd.startsWith(pattern) || cmd.includes(` ${pattern}`)
+    );
+    
+    // For commands likely to run indefinitely, use spawn with manual timeout
+    if (isLikelyIndefinite) {
+      console.log(chalk.gray(`  Note: This command might run indefinitely. Will capture output for ${timeout/1000}s.`));
+      
+      // Use spawn to capture real-time output
+      const { spawn } = require('child_process');
+      return new Promise(resolve => {
+        let outputBuffer = '';
+        let errorOccurred = false;
+        
+        // Split command into executable and args
+        const parts = cmd.split(' ');
+        const executable = parts[0];
+        const args = parts.slice(1);
+        
+        // Spawn the process
+        const childProcess = spawn(executable, args, {
+          shell: true,
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+        
+        // Capture stdout
+        childProcess.stdout.on('data', (data) => {
+          const chunk = data.toString();
+          outputBuffer += chunk;
+          
+          // Check for error patterns in real-time
+          if (chunk.toLowerCase().includes('error') || 
+              chunk.toLowerCase().includes('failed') ||
+              chunk.toLowerCase().includes('exception')) {
+            errorOccurred = true;
+          }
+        });
+        
+        // Capture stderr
+        childProcess.stderr.on('data', (data) => {
+          const chunk = data.toString();
+          outputBuffer += chunk;
+          errorOccurred = true;
+        });
+        
+        // Handle process completion
+        childProcess.on('close', (code) => {
+          resolve({
+            ok: code === 0 && !errorOccurred,
+            output: outputBuffer,
+            timedOut: false
+          });
+        });
+        
+        // Set timeout to kill the process
+        setTimeout(() => {
+          if (!childProcess.killed) {
+            childProcess.kill('SIGTERM');
+            
+            // Wait a moment for any final output
+            setTimeout(() => {
+              resolve({
+                ok: !captureTimeoutAsError && !errorOccurred,
+                output: outputBuffer + '\n[Command timed out after ' + (timeout/1000) + ' seconds]',
+                timedOut: true
+              });
+            }, 500);
+          }
+        }, timeout);
+      });
+    }
+    
+    // For normal commands, use execSync with timeout
     const out = execSync(`${cmd} 2>&1`, { encoding: 'utf8', timeout });
-    return { ok: true, output: out };
+    return { ok: true, output: out, timedOut: false };
   } catch (e) {
-    return { ok: false, output: e.stdout?.toString() || e.message };
+    // Check if this was a timeout
+    const wasTimeout = e.signal === 'SIGTERM' || e.message.includes('timeout');
+    
+    return { 
+      ok: false, 
+      output: e.stdout?.toString() || e.message,
+      timedOut: wasTimeout
+    };
   }
 }
 

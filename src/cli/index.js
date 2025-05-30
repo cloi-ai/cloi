@@ -54,6 +54,7 @@ import {
 import { extractDiff, confirmAndApply } from '../utils/patch.js';
 import { displaySnippetsFromError, readFileContext, extractFilesFromTraceback, buildErrorContext, getErrorLines } from '../utils/traceback.js';
 import { startThinking } from '../core/ui/thinking.js';
+// Web handler removed - using regular debug pipeline for web issues
 // Import prompt builders for debugging
 import { buildAnalysisPrompt, buildSummaryPrompt } from '../core/promptTemplates/analyze.js';
 import { buildErrorTypePrompt } from '../core/promptTemplates/classify.js';
@@ -131,7 +132,7 @@ async function interactiveLoop(initialCmd, limit, initialModel) {
         BOX.PROMPT
       ));
       // Add improved gray text below the boxen prompt for exit instructions and /debug info
-      console.log(chalk.gray('  Run /debug to auto-fix the last command, or ctrl+c when you\'re done.'));
+      console.log(chalk.gray('  Run /debug to auto-fix the last command or analyze pasted content, or ctrl+c when you\'re done.'));
   
       const input = await new Promise(r => {
         const rl = getReadline();
@@ -144,7 +145,42 @@ async function interactiveLoop(initialCmd, limit, initialModel) {
       switch (input) {
         case '/debug': {
           process.stdout.write('\n');
-          await debugLoop(lastCmd, limit, currentModel);
+          
+          // Step 1: Ask if the user wants to provide additional context
+          console.log(boxen(
+            'Would you like to provide additional context (e.g., from browser errors)?',
+            { ...BOX.PROMPT, title: 'Debug Options' }
+          ));
+          
+          const debugOption = await askInput('Enter "paste" to provide additional context or press Enter to debug normally: ');
+          
+          let userInput = null;
+          if (debugOption.trim().toLowerCase() === 'paste') {
+            // Get pasted content from user
+            console.log(boxen(
+              'Paste your additional context below:',
+              { ...BOX.PROMPT, title: 'Additional Context' }
+            ));
+            
+            userInput = await askInput('', { multiline: true });
+            
+            if (!userInput || userInput.trim() === '') {
+              console.log(chalk.gray('  No content pasted. Proceeding with normal debugging.'));
+              userInput = null;
+            } else {
+              console.log(chalk.gray('  Got it! I will use this context to help with debugging.'));
+            }
+          }
+          
+          // Step 2-6: Pass the user input to the debug loop as an additional parameter
+          // The debug loop will:
+          // - Check terminal log for errors
+          // - If no error detected, evaluate if it's a web or regular command
+          // - Run appropriate pipeline to retrieve error log (puppeteer or command run)
+          // - Use the error log with user input as RAG input
+          // - Analyze and provide solutions
+          await debugLoop(lastCmd, limit, currentModel, userInput);
+          
           process.stdout.write('\n');
           break;
         }
@@ -226,7 +262,7 @@ async function interactiveLoop(initialCmd, limit, initialModel) {
         case '/help':
           console.log(boxen(
             [
-              '/debug    – let me fix that error for you',
+              '/debug    – let me fix that error for you (with option to paste additional context)',
               '/index    – scan your codebase for better debugging',
               '/model    – pick a different AI model',
               '/logging  – set up automatic error logging (zsh only)',
@@ -393,6 +429,7 @@ async function checkCodeBERTModel() {
     
     // Check if model directory exists
     if (!fs.existsSync(modelFilesDir)) {
+      console.log(chalk.gray(`  Model directory not found at ${modelFilesDir}`));
       return { installed: false, modelPath: modelFilesDir };
     }
     
@@ -404,15 +441,38 @@ async function checkCodeBERTModel() {
       'vocab.json'
     ];
     
+    let missingFiles = [];
     for (const file of requiredFiles) {
       const filePath = path.join(modelFilesDir, file);
       if (!fs.existsSync(filePath)) {
-        return { installed: false, modelPath: modelFilesDir };
+        missingFiles.push(file);
       }
     }
     
+    if (missingFiles.length > 0) {
+      console.log(chalk.gray(`  Missing CodeBERT files: ${missingFiles.join(', ')}`));
+      return { installed: false, modelPath: modelFilesDir };
+    }
+    
+    // Check file sizes to ensure they're not empty
+    let invalidFiles = [];
+    for (const file of requiredFiles) {
+      const filePath = path.join(modelFilesDir, file);
+      const stats = fs.statSync(filePath);
+      if (stats.size === 0) {
+        invalidFiles.push(`${file} (empty)`);
+      }
+    }
+    
+    if (invalidFiles.length > 0) {
+      console.log(chalk.gray(`  Invalid CodeBERT files: ${invalidFiles.join(', ')}`));
+      return { installed: false, modelPath: modelFilesDir };
+    }
+    
+    console.log(chalk.gray(`  CodeBERT model found at ${modelFilesDir}`));
     return { installed: true, modelPath: modelFilesDir };
   } catch (error) {
+    console.log(chalk.gray(`  Error checking CodeBERT model: ${error.message}`));
     return { installed: false, modelPath: '' };
   }
 }
@@ -827,8 +887,13 @@ async function ensureCodeBERTServiceRunning(projectRoot) {
  * @param {string} initialCmd - The command to start debugging.
  * @param {number} limit - History limit (passed down from interactive loop/args).
  * @param {string} currentModel - The Ollama model to use.
+ * @param {string|null} userInput - Optional user input to enhance the analysis.
  */
-async function debugLoop(initialCmd, limit, currentModel) {
+async function debugLoop(initialCmd, limit, currentModel, userInput = null) {
+    // Import web functionality dynamically to avoid circular dependencies
+    const { isWebIssue, runPuppeteer, analyzeWithLLMWebAgent, fetchHostCommand, killProcessesOnPorts, runCommandInNewTerminal, extractUrls, extractLocalhostUrls } = await import('../web/index.js');
+    const { isWebError } = await import('../web/errorDetection.js');
+    
     const iterations = [];
     const ts = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 15);
     const logDir = join(__dirname, 'debug_history');
@@ -935,6 +1000,11 @@ async function debugLoop(initialCmd, limit, currentModel) {
     // Initialize fileInfo with default values
     let fileInfo = null;
     
+    // Note if user provided additional input
+    if (userInput && userInput.trim()) {
+      console.log(chalk.gray('  You\'ve provided additional context that will be used in the analysis.'));
+    }
+    
     // First, try to extract recent errors from terminal logs
     let cmd = initialCmd;
     console.log(chalk.gray('  Let me check if you\'ve got any recent errors logged...\n'));
@@ -997,23 +1067,195 @@ async function debugLoop(initialCmd, limit, currentModel) {
         console.log(chalk.gray('  Nothing in the logs, so let me try running this fresh...'));
       }
       await echoCommand(cmd);
-      ({ ok, output } = runCommand(cmd));
+      
+      // Use a 5-second timeout for commands that might run indefinitely
+      // This prevents commands like 'npm start' from blocking the analysis
+      const DEBUG_COMMAND_TIMEOUT = 5000; // 5 seconds
+      const result = runCommand(cmd, DEBUG_COMMAND_TIMEOUT, true);
+      ok = result.ok;
+      output = result.output;
+      
+      // First, check if we have a command timeout - mark it but don't change prioritization
+      if (result.timedOut) {
+        console.log(chalk.yellow(`  Command was terminated after ${DEBUG_COMMAND_TIMEOUT/1000} seconds to prevent blocking analysis.`));
+        // Just add a marker without changing the structure yet
+        output = `[COMMAND_TIMEOUT] Command '${cmd}' was terminated after ${DEBUG_COMMAND_TIMEOUT/1000} seconds.\n\n${output}`;
+      }
+      
+      // Extract file paths from terminal output to check prioritization
+      const filesFromOutput = extractFilesFromTraceback(output);
+      const hasFilePaths = filesFromOutput.size > 0;
+      
+      // Now structure the output based on prioritization rules:
+      // 1. User input
+      // 2. Terminal log with file path
+      // 3. Terminal log without file path
+      let structuredOutput = '';
+      
+      // Priority 1: User input (if available)
+      if (userInput && userInput.trim()) {
+        console.log(chalk.green(`  Using your provided error details as primary analysis context.`));
+        structuredOutput += `--- PRIORITY 1: USER PROVIDED CONTEXT ---\n${userInput}\n\n`;
+      }
+      
+      // Priority 2 & 3: Terminal output (with special handling for file paths)
+      if (hasFilePaths) {
+        // Priority 2: Terminal log with file paths
+        console.log(chalk.gray(`  Found file paths in terminal output (secondary priority).`));
+        structuredOutput += `--- PRIORITY 2: TERMINAL OUTPUT WITH FILE PATHS ---\n${output}`;
+      } else {
+        // Priority 3: Terminal log without file paths
+        structuredOutput += `--- PRIORITY 3: TERMINAL OUTPUT ---\n${output}`;
+      }
+      
+      // Replace the output with our prioritized structure
+      output = structuredOutput;
     }
     
-    if (ok && !detectFailure(output)) {
-      console.log(boxen(chalk.green('Wait... this actually worked fine! No errors here.'), { ...BOX.OUTPUT, title: 'All Good!' }));
-      return;
+    // Flag to track if we've already processed this as a web issue
+    let webProcessed = false;
+    
+    // First, check if the command itself is web-related (regardless of output)
+    const initialCmdWebCheck = isWebIssue(initialCmd);
+    
+    if (initialCmdWebCheck.isWebIssue) {
+      webProcessed = true; // Mark as processed
+      // console.log(chalk.cyan('=== WEB PIPELINE ACTIVATED: Web command detected in initial command ==='));
+      
+      // Extract URLs from terminal logs and command output
+      const { extractLocalhostUrls, runPuppeteer } = await import('../web/index.js');
+      const urls = await extractLocalhostUrls(output);
+      
+      if (urls.length > 0) {
+        // console.log(chalk.green(`  Detected URLs: ${urls.join(', ')}`));
+        
+        // Get the first URL to test
+        const testUrl = urls[0];
+        
+        // console.log(boxen(
+        //   chalk.blue(`Web command detected: ${initialCmd}\n\nTesting URL: ${chalk.cyan(testUrl)}`),
+        //   { ...BOX.OUTPUT, title: 'Web Command' }
+        // ));
+        
+        // Run puppeteer to get browser logs
+        // console.log(chalk.magenta('=== PUPPETEER STARTING: Retrieving browser error logs ==='));
+        const browserOutput = await runPuppeteer(testUrl, process.cwd());
+        // console.log(chalk.magenta(`=== PUPPETEER COMPLETE: Retrieved ${browserOutput.split('\n').length} lines of browser logs ===`));
+        
+        // Add browser logs to the output with highest priority
+        if (browserOutput && browserOutput.trim()) {
+          // Prepend browser logs to the output with highest priority
+          output = `--- PRIORITY 1: BROWSER LOGS ---\n${browserOutput}\n\n${output}`;
+        }
+      } else {
+        console.log(boxen(
+          chalk.blue(`Web command detected: ${initialCmd}\n\nNo URLs detected.`),
+          { ...BOX.OUTPUT, title: 'Web Command' }
+        ));
+      }
+      
+      // Continue with the regular debug pipeline - don't return here
     }
+    
+    // Check if there's an error and determine if it's web-related
+    if (detectFailure(output) && !webProcessed) { // Only check if not already processed as web
+      // Check if the error is web-related based on error patterns
+      if (isWebError(output)) {
+        webProcessed = true; // Mark as processed
+        // console.log(chalk.cyan('=== WEB PIPELINE ACTIVATED: Web-related error detected ==='));
+        
+        // Extract URLs from the error output
+        const { extractLocalhostUrls, runPuppeteer } = await import('../web/index.js');
+        const webIssueResult = isWebIssue(output);
+        const urls = webIssueResult.localhostUrls || [];
+        
+        if (urls.length > 0) {
+          // console.log(chalk.green(`  Detected URLs: ${urls.join(', ')}`));
+          
+          // Get the first URL to test
+          const testUrl = urls[0];
+          
+          // console.log(boxen(
+          //   chalk.blue(`Web error detected\n\nTesting URL: ${chalk.cyan(testUrl)}`),
+          //   { ...BOX.OUTPUT, title: 'Web Error' }
+          // ));
+          
+          // Run puppeteer to get browser logs
+          // console.log(chalk.magenta('=== PUPPETEER STARTING: Retrieving browser error logs ==='));
+          const browserOutput = await runPuppeteer(testUrl, process.cwd());
+          // console.log(chalk.magenta(`=== PUPPETEER COMPLETE: Retrieved ${browserOutput.split('\n').length} lines of browser logs ===`));
+          
+          // Add browser logs to the output with highest priority
+          if (browserOutput && browserOutput.trim()) {
+            // Prepend browser logs to the output with highest priority
+            output = `--- PRIORITY 1: BROWSER LOGS ---\n${browserOutput}\n\n${output}`;
+          }
+        } else {
+          console.log(boxen(
+            chalk.blue('Web-related error detected, but no URLs found to test.'),
+            { ...BOX.OUTPUT, title: 'Web Error' }
+          ));
+        }
+        
+        // Continue with the regular debug pipeline - don't return here
+      } else {
+        // If it's not a web-related error, continue with normal error handling
+      }
+      // If it's not a web-related error, continue with normal error handling
+    } else if (ok && !webProcessed) { // Only check if not already processed as web
+      // No error detected, check if it's a web-related command
+      const webIssueResult = isWebIssue(output);
       
+      if (webIssueResult.isWebIssue) {
+        webProcessed = true; // Mark as processed
+        // console.log(chalk.cyan('=== WEB PIPELINE ACTIVATED: Web command output detected ==='));
+        
+        // Extract URLs from the command output
+        const { extractLocalhostUrls, runPuppeteer } = await import('../web/index.js');
+        const urls = webIssueResult.localhostUrls || [];
+        
+        if (urls.length > 0) {
+          // console.log(chalk.green(`  Detected URLs: ${urls.join(', ')}`));
+          
+          // Get the first URL to test
+          const testUrl = urls[0];
+          
+          // console.log(boxen(
+          //   chalk.blue(`Web command output detected\n\nTesting URL: ${chalk.cyan(testUrl)}`),
+          //   { ...BOX.OUTPUT, title: 'Web Command Output' }
+          // ));
+          
+          // Run puppeteer to get browser logs
+          // console.log(chalk.magenta('=== PUPPETEER STARTING: Retrieving browser error logs ==='));
+          const browserOutput = await runPuppeteer(testUrl, process.cwd());
+          // console.log(chalk.magenta(`=== PUPPETEER COMPLETE: Retrieved ${browserOutput.split('\n').length} lines of browser logs ===`));
+          
+          // Add browser logs to the output with highest priority
+          if (browserOutput && browserOutput.trim()) {
+            // Prepend browser logs to the output with highest priority
+            output = `--- PRIORITY 1: BROWSER LOGS ---\n${browserOutput}\n\n${output}`;
+          }
+        } else {
+          console.log(boxen(
+            chalk.blue('Web command output detected, but no URLs found to test.'),
+            { ...BOX.OUTPUT, title: 'Web Command Output' }
+          ));
+        }
+        
+        // Continue with the regular debug pipeline - don't return here
+      } else {
+        console.log(boxen(chalk.green('No errors detected.'), { ...BOX.OUTPUT, title: 'Success' }));
+        return;
+      }
+    }
+    
     // Extract possible file paths from the command or error logs
-      try {
-    // If we extracted error from logs and have file paths already, use those
-    if (logError && logFiles && logFiles.size > 0) {
-      // Use the first file from the logs
-      filePath = Array.from(logFiles.keys())[0];
-
-      
-              // Check if it's a valid file
+    try {
+      // If we extracted error from logs and have file paths already, use those
+      if (logError && logFiles && logFiles.size > 0) {
+        // Use the first file from the logs
+        filePath = Array.from(logFiles.keys())[0];
+      // Check if it's a valid file
         isValidSourceFile = filePath && fs.existsSync(filePath) && fs.statSync(filePath).isFile();
         
         // If not a file, try as absolute path relative to project root
@@ -1025,20 +1267,51 @@ async function debugLoop(initialCmd, limit, currentModel) {
       // Extract possible filename from commands like "python file.py", "node script.js", etc.
       let possibleFile = initialCmd;
       
-      // Common command prefixes to check for
-      const commandPrefixes = ['python', 'python3', 'node', 'ruby', 'perl', 'php', 'java', 'javac', 'bash', 'sh'];
-      
-      // Check if the command starts with any of the common prefixes
-      for (const prefix of commandPrefixes) {
-        if (initialCmd.startsWith(prefix + ' ')) {
-          // Extract everything after the prefix and a space
-          possibleFile = initialCmd.substring(prefix.length + 1).trim();
-          break;
+      // First, check if we have user input that might contain file references
+      if (userInput && userInput.trim()) {
+        console.log(chalk.gray('  Checking user input for file references...'));
+        
+        // Extract potential filenames from user input using regex
+        const fileMatches = [];
+        
+        // Match common file extensions
+        const fileRegex = /\b([\w-]+\.(js|jsx|ts|tsx|py|rb|java|go|php|html|css))\b/g;
+        let match;
+        while ((match = fileRegex.exec(userInput)) !== null) {
+          fileMatches.push(match[1]);
+        }
+        
+        // If we found files in user input, use the first one
+        if (fileMatches.length > 0) {
+          console.log(chalk.gray(`  Found potential file in user input: ${fileMatches[0]}`));
+          possibleFile = fileMatches[0];
         }
       }
       
-      // Further extract arguments if present (get first word that doesn't start with -)
-      possibleFile = possibleFile.split(' ').find(part => part && !part.startsWith('-')) || '';
+      // If we didn't find a file in user input, fall back to command extraction
+      if (!possibleFile || possibleFile === initialCmd) {
+        // console.log(chalk.gray('  No files found in user input, extracting from command...'));
+        
+        // Common command prefixes to check for
+        const commandPrefixes = ['python', 'python3', 'node', 'ruby', 'perl', 'php', 'java', 'javac', 'bash', 'sh'];
+        
+        // Check if the command starts with any of the common prefixes
+        for (const prefix of commandPrefixes) {
+          if (initialCmd.startsWith(prefix + ' ')) {
+            // Extract everything after the prefix and a space
+            possibleFile = initialCmd.substring(prefix.length + 1).trim();
+            break;
+          }
+        }
+        
+        // Further extract arguments if present (get first word that doesn't start with -)
+        possibleFile = possibleFile.split(' ').find(part => part && !part.startsWith('-')) || '';
+        
+        // No default fallback - let RAG handle file selection
+        if ((!possibleFile || possibleFile === '')) {
+          console.log(chalk.gray('  No specific file identified, will rely on RAG to find relevant files'));
+        }
+      }
       
       // First check relative path
       filePath = possibleFile;
@@ -1117,9 +1390,10 @@ async function debugLoop(initialCmd, limit, currentModel) {
       
       // Enhance with RAG context
       let enhancedFileInfo = currentFileInfo;
+      
       try {
         const { enhanceWithRAG } = await import('../core/rag.js');
-        enhancedFileInfo = await enhanceWithRAG(output, currentFileInfo, projectRoot);
+        enhancedFileInfo = await enhanceWithRAG(output, currentFileInfo, projectRoot, userInput);
         
         // If we have RAG context, display a clean summary
         if (enhancedFileInfo.ragContext) {
@@ -1163,12 +1437,29 @@ async function debugLoop(initialCmd, limit, currentModel) {
         console.log(chalk.gray(`  Note: RAG enhancement skipped: ${error.message}`));
       }
       
+      // Add web-specific prompt hints if this is a web issue
+      let webHints = '';
+      if (webProcessed) {
+        webHints = `
+# Web-Specific Analysis Instructions
+- Look beyond simple connection errors like ERR_CONNECTION_REFUSED
+- Analyze the full context of the issue, including command output and error patterns
+- For connection errors, check if there are clues about React issues outside of connection errors
+- Focus on detecting patterns across the entire log rather than fixating on individual errors
+- If you see connection refused errors, consider that the app might be crashing due to code issues
+- Prioritize identifying root causes over surface-level connection issues
+- If you find the root cause, you can ignore any other errors that might be caused by the root cause
+`;
+      }
+      
       const { analysis, reasoning: analysisReasoning, wasStreamed } = await analyzeWithLLM(
         output, 
         currentModel, 
         enhancedFileInfo,
         codeSummary, 
-        filePath
+        filePath,
+        'error_analysis',
+        webHints // Pass web hints to the LLM
       );
       
       // Display reasoning if available

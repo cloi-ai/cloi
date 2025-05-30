@@ -100,6 +100,22 @@ export function isUserFile(p) {
 export function extractFilesFromTraceback(log) {
   const result = new Map();
   
+  // First, check if this is a user-provided error with priority markers
+  const hasPriority1 = log.includes('--- PRIORITY 1: USER PROVIDED CONTEXT ---');
+  let userProvidedContext = '';
+  
+  if (hasPriority1) {
+    // Extract user provided context to prioritize it for file extraction
+    const userContentMatch = log.match(/--- PRIORITY 1: USER PROVIDED CONTEXT ---\n([\s\S]*?)(?=\n---|$)/m);
+    if (userContentMatch && userContentMatch[1]) {
+      userProvidedContext = userContentMatch[1].trim();
+      console.log(chalk.gray('  Prioritizing user-provided context for file extraction...'));
+      
+      // Apply all patterns to user input first to ensure it gets priority
+      applyPatternsToContent(userProvidedContext, result);
+    }
+  }
+  
   // Pattern matchers for different programming language traceback formats
   const patterns = [
     // Python-style traceback: File "path", line number
@@ -117,9 +133,43 @@ export function extractFilesFromTraceback(log) {
     // Java/JVM-style traceback: at package.Class.method(Class.java:line)
     { regex: /at\s+[\w$.]+\(([^:)]+):(\d+)\)/g, fileGroup: 1, lineGroup: 2 },
     
+    // Browser bundle.js references
+    { regex: /@(http:\/\/localhost:[0-9]+\/static\/js\/[^:]+):(\d+):(\d+)/g, fileGroup: 1, lineGroup: 2 },
+    
     // Generic path:line pattern that might appear in various errors
-    { regex: /\b((?:\/[^\/\s:]+)+\.[a-zA-Z0-9]+):(\d+)/g, fileGroup: 1, lineGroup: 2 }
+    { regex: /\b((?:\/[^\/\s:]+)+\.[a-zA-Z0-9]+):(\d+)/g, fileGroup: 1, lineGroup: 2 },
+    
+    // Common file extensions mentioned in errors
+    { regex: /\b([\w-]+\.(js|jsx|ts|tsx|py|rb|java|go|php|html|css))\b/g, fileGroup: 1, lineGroup: null }
   ];
+  
+  /**
+   * Helper function to apply all patterns to a specific content
+   * @param {string} content - Content to search for file patterns
+   * @param {Map} resultMap - Map to store results
+   */
+  function applyPatternsToContent(content, resultMap) {
+    // Apply all patterns to this content
+    for (const pattern of patterns) {
+      let match;
+      const { regex, fileGroup, lineGroup } = pattern;
+      
+      // Reset the regex for each iteration
+      regex.lastIndex = 0;
+      
+      while ((match = regex.exec(content)) !== null) {
+        const file = match[fileGroup];
+        // If lineGroup is null, use 1 as default line number
+        const line = lineGroup ? parseInt(match[lineGroup], 10) : 1;
+        
+        // Skip if we couldn't parse the line number when it's required
+        if (lineGroup && isNaN(line)) continue;
+        
+        // Add to results
+        resultMap.set(file, line);
+      }
+    }
+  }
   
   // Collect frames for each pattern
   const allFrames = [];

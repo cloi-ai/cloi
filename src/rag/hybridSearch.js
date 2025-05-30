@@ -184,13 +184,25 @@ export function prepareQueryForSearch(rawQuery) {
  * @param {string} errorLog - The original error log
  * @returns {Object} The most likely root cause file
  */
+// Common words to exclude when matching error terms
+const commonWords = [
+  'the', 'and', 'that', 'have', 'for', 'not', 'with', 'you', 'this', 'but',
+  'his', 'from', 'they', 'she', 'will', 'would', 'there', 'their', 'what',
+  'about', 'which', 'when', 'make', 'like', 'time', 'just', 'him', 'know',
+  'take', 'people', 'into', 'year', 'your', 'good', 'some', 'could', 'them',
+  'see', 'other', 'than', 'then', 'now', 'look', 'only', 'come', 'its', 'over',
+  'think', 'also', 'back', 'after', 'use', 'two', 'how', 'our', 'work', 'first',
+  'well', 'way', 'even', 'new', 'want', 'because', 'any', 'these', 'give', 'day',
+  'most', 'cant', 'cant', 'using', 'does', 'where', 'been', 'should', 'those'
+];
+
 export function identifyRootCauseFile(searchResults, errorLog) {
   if (!searchResults || searchResults.length === 0) {
     return null;
   }
   
-  // Extract file paths from error log
-  const filePathPattern = /([a-zA-Z0-9_-]+\.(?:js|py|java|rb|go|cpp|c|h|ts|tsx|jsx))/g;
+  // Extract file paths from error log - this is framework-agnostic
+  const filePathPattern = /([a-zA-Z0-9_-]+\.(?:js|py|java|rb|go|cpp|c|h|ts|tsx|jsx|php|html|css))/g;
   const mentionedFiles = new Set();
   
   const matches = [...errorLog.matchAll(filePathPattern)];
@@ -200,19 +212,40 @@ export function identifyRootCauseFile(searchResults, errorLog) {
     }
   }
   
-  // Score each result based on various heuristics
+  // Score each result based on generic heuristics only
   const scoredResults = searchResults.map(result => {
-    const { metadata, combinedScore } = result;
+    const { metadata, combinedScore, id } = result;
     let rootCauseScore = combinedScore;
     
-    // Boost score if file is mentioned in the error log
-    if (metadata && metadata.fileName && mentionedFiles.has(metadata.fileName)) {
-      rootCauseScore *= 1.5;
+    // Get filename for scoring
+    const fileName = metadata?.fileName || '';
+    const filePath = metadata?.filePath || '';
+    
+    // Boost score if file is mentioned in the error log (strongest signal)
+    // This is framework-agnostic - if a file is mentioned in the error, it's relevant
+    if (fileName && mentionedFiles.has(fileName)) {
+      rootCauseScore *= 2.0;
     }
     
-    // Boost score for files with imports (they're more likely to be root causes)
-    if (metadata && metadata.hasImports) {
-      rootCauseScore *= 1.2;
+    // Boost files that contain error-related keywords in their content
+    // This is framework-agnostic - looking for error-related terms in file content
+    const fileContent = metadata?.content || '';
+    const errorTerms = errorLog.match(/\b\w{3,}\b/g) || [];
+    let matchCount = 0;
+    
+    // Count how many significant error terms appear in the file content
+    for (const term of errorTerms) {
+      if (term.length > 3 && !commonWords.includes(term.toLowerCase())) {
+        const regex = new RegExp(`\\b${term}\\b`, 'i');
+        if (regex.test(fileContent)) {
+          matchCount++;
+        }
+      }
+    }
+    
+    // Boost score based on how many error terms match
+    if (matchCount > 0) {
+      rootCauseScore *= (1 + (matchCount * 0.1));
     }
     
     return {

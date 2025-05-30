@@ -19,6 +19,8 @@ src/cli/debug_history/
 .env.development.local
 .env.test.local
 .env.production.local
+.venv/
+.cloi/
 
 # OS specific files
 .DS_Store
@@ -29,4 +31,5 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+*.tgz
 *~ 

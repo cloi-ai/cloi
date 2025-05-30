@@ -31,9 +31,10 @@ import fs from 'fs';
  * @param {string} [codeSummary=''] - Optional code summary
  * @param {string} [filePath=''] - Optional file path
  * @param {string} [optimizationSet='error_analysis'] - The optimization set to use
+ * @param {string} [additionalHints=''] - Additional hints for the LLM (e.g., web-specific guidance)
  * @returns {Promise<{analysis: string, reasoning: string, wasStreamed: boolean}>} - Analysis, reasoning and streaming flag
  */
-export async function analyzeWithLLM(errorOutput, model = 'phi4:latest', fileInfo = {}, codeSummary = '', filePath = '', optimizationSet = 'error_analysis') {
+export async function analyzeWithLLM(errorOutput, model = 'phi4:latest', fileInfo = {}, codeSummary = '', filePath = '', optimizationSet = 'error_analysis', additionalHints = '') {
   // Start thinking animation - use normal positioning to avoid spacing issues
   const stopThinking = startThinking(getThinkingPhrasesForAnalysis(), false);
   
@@ -69,7 +70,12 @@ export async function analyzeWithLLM(errorOutput, model = 'phi4:latest', fileInf
     }
     
     // Build the analysis prompt with enhanced context
-    const prompt = buildAnalysisPrompt(errorOutput, enhancedFileInfo, codeSummary, filePath, context);
+    let prompt = buildAnalysisPrompt(errorOutput, enhancedFileInfo, codeSummary, filePath, context);
+    
+    // Add additional hints if provided (e.g., web-specific guidance)
+    if (additionalHints && additionalHints.trim()) {
+      prompt += '\n\n' + additionalHints;
+    }
     
     const max_tokens = 512; // Increased for RAG context
     

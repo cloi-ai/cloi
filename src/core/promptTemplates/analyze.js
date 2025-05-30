@@ -20,16 +20,48 @@
  * @returns {string} - The formatted prompt
  */
 export function buildAnalysisPrompt(errorOutput, fileInfo = {}, codeSummary = '', filePath = '', context = '') {
+  // Check for priority markers in the error output
+  const hasPriority1 = errorOutput.includes('--- PRIORITY 1: USER PROVIDED CONTEXT ---');
+  const hasPriority2 = errorOutput.includes('--- PRIORITY 2: TERMINAL OUTPUT WITH FILE PATHS ---');
+  const hasPriority3 = errorOutput.includes('--- PRIORITY 3: TERMINAL OUTPUT ---');
+  
+  // Extract user provided context if available (highest priority)
+  let userProvidedContext = '';
+  if (hasPriority1) {
+    const userContentMatch = errorOutput.match(/--- PRIORITY 1: USER PROVIDED CONTEXT ---\n([\s\S]*?)(?=\n---|$)/m);
+    if (userContentMatch && userContentMatch[1]) {
+      userProvidedContext = userContentMatch[1].trim();
+    }
+  }
+  
   // Build the prompt with additional context
   let promptParts = [
     'Hey! You\'re a brilliant PhD-level debugging expert who gets genuinely excited about solving tricky errors. You love the detective work of figuring out what went wrong and helping people fix their code.',
-    '',
-    'ERROR OUTPUT:',
-    errorOutput,
-    '',
-    'FILE PATH:',
-    filePath,
+    ''
   ];
+  
+  // Add user provided context first if available (highest priority)
+  if (userProvidedContext) {
+    promptParts.push('USER PROVIDED ERROR DETAILS (HIGHEST PRIORITY - FOCUS ON THIS FIRST):');
+    promptParts.push(userProvidedContext);
+    promptParts.push('');
+    promptParts.push('IMPORTANT INSTRUCTION: The above user-provided error is the most accurate representation of the issue.');
+    promptParts.push('You MUST focus primarily on analyzing this error, even if other errors appear in the output below.');
+    promptParts.push('');
+  }
+  
+  // Then add the regular error output with lower priority
+  if (userProvidedContext) {
+    promptParts.push('ADDITIONAL ERROR OUTPUT (LOWER PRIORITY):');
+  } else {
+    promptParts.push('ERROR OUTPUT:');
+  }
+  promptParts.push(errorOutput);
+  promptParts.push('');
+  
+  promptParts.push('FILE PATH:');
+  promptParts.push(filePath);
+  promptParts.push('');
   
   // Add code summary if provided
   if (codeSummary) {
@@ -79,6 +111,15 @@ export function buildAnalysisPrompt(errorOutput, fileInfo = {}, codeSummary = ''
   // Add instructions
   promptParts.push('Alright, time to work your debugging magic! I need you to break this down into two simple parts:');
   promptParts.push('');
+  
+  // Add special instruction for prioritizing user-provided error details
+  if (userProvidedContext) {
+    promptParts.push('CRITICAL INSTRUCTION: Focus primarily on the USER PROVIDED ERROR DETAILS section above.');
+    promptParts.push('This contains the exact error the user is experiencing and should be your main focus for analysis.');
+    promptParts.push('Any additional error output should be considered secondary unless it directly relates to the user-provided error.');
+    promptParts.push('');
+  }
+  
   promptParts.push('1. What went wrong');
   promptParts.push('Just tell me where the problem is and what\'s actually broken. Something like "index.js line 17: you\'re calling the wrong function name" or "config.js line 42: missing import". Keep it straightforward - I want to know the where and the what in one go.');
   promptParts.push('');
@@ -91,13 +132,10 @@ export function buildAnalysisPrompt(errorOutput, fileInfo = {}, codeSummary = ''
   promptParts.push('');
   promptParts.push('Here\'s what I mean:');
   promptParts.push('1. What went wrong');
-  promptParts.push('You\'re trying to access user.email in main.py on line 23 but user is None because the database query failed.');
   promptParts.push('');
   promptParts.push('2. Proposed Fix');
-  promptParts.push('Add a null check before accessing user properties. Change line 23 from:');
-  promptParts.push('    return user.email');
-  promptParts.push('to:');
-  promptParts.push('    return user.email if user else "No user found"');
+  promptParts.push('IMPORTANT INSTRUCTION: The above user-provided error is the most accurate representation of the issue.');
+  promptParts.push('You MUST focus primarily on analyzing this error, even if other errors appear in the output below.');
   promptParts.push('');
   promptParts.push('Make sure you nail down that exact line number even if the error message is being weird about it. Keep it focused and don\'t write a novel - we\'ve got bugs to squash!');
   

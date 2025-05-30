@@ -11,6 +11,7 @@ import { findRepoOrProjectRoot, getProjectInfo } from '../utils/projectUtils.js'
 import { checkRAGRequirements, displayRAGStatus } from '../utils/pythonCheck.js';
 import fs from 'fs';
 import path from 'path';
+import chalk from 'chalk';
 
 // Cache for RAG initialization to prevent duplicate loading messages
 const ragInitCache = new Map();
@@ -19,23 +20,125 @@ const ragInitCache = new Map();
  * Enhance error analysis with RAG-retrieved context
  * @param {string} errorOutput - The error output to analyze
  * @param {Object} fileInfo - Current file information
- * @param {string} currentDir - Current working directory
+ * @param {string} projectRoot - Current project root
+ * @param {string|null} userInput - Optional user input to enhance the analysis
  * @returns {Promise<Object>} Enhanced file info with RAG context
  */
-export async function enhanceWithRAG(errorOutput, fileInfo, currentDir) {
+export async function enhanceWithRAG(errorOutput, fileInfo, projectRoot, userInput = '') {
   try {
-    // Find project root using comprehensive detection
-    const rootInfo = await findRepoOrProjectRoot(currentDir);
-    
+    // Detect project root if not provided
+    const rootInfo = await findRepoOrProjectRoot(projectRoot);    
     if (rootInfo.confidence === 'minimal') {
       throw new Error('No clear project structure found. RAG works best in organized projects.');
     }
     
-    // Retrieve relevant files using RAG with detected project root
-    const ragResults = await retrieveRelevantFiles(errorOutput, rootInfo.root, {
-      k: 3, // Get top 3 results
-      identifyRoot: true
-    });
+    // The CLI layer now structures the input with explicit priority markers
+    // We just need to use it directly as the prioritization is already handled
+    let combinedInput = errorOutput;
+    
+    // Log appropriate messages based on the detected priorities
+    // if (errorOutput.includes('--- PRIORITY 1: USER PROVIDED CONTEXT ---')) {
+    //   console.log(chalk.gray('  Analyzing with user-provided context as highest priority...'));
+    // }
+    
+    // if (errorOutput.includes('--- PRIORITY 2: TERMINAL OUTPUT WITH FILE PATHS ---')) {
+    //   console.log(chalk.gray('  Including terminal output with file paths as secondary priority...'));
+    // }
+    
+    // if (errorOutput.includes('--- PRIORITY 3: TERMINAL OUTPUT ---')) {
+    //   console.log(chalk.gray('  Including terminal output as tertiary priority...'));
+    // }
+    
+    // If there's still user input that wasn't already incorporated, add it
+    // This is a fallback for backward compatibility
+    if (userInput && userInput.trim() && !errorOutput.includes(userInput)) {
+      combinedInput = `--- PRIORITY 1: ADDITIONAL USER CONTEXT ---\n${userInput}\n\n${errorOutput}`;
+    }
+    
+    // Retrieve relevant files using RAG with detected project root and combined input
+    let ragResults;
+    try {
+      // First get stats to determine how many files are indexed
+      const stats = await getRAGStats(rootInfo.root);
+      const totalIndexed = stats.totalFiles || 100; // Default to 100 if can't determine
+      
+      // Retrieve ALL indexed files by setting k to the total number of indexed files
+      ragResults = await retrieveRelevantFiles(combinedInput, rootInfo.root, {
+        k: totalIndexed, // Get ALL indexed files
+        identifyRoot: true
+      });
+      
+      // Process results to ensure they have the expected structure
+      if (ragResults && ragResults.results && ragResults.results.length > 0) {
+        // Map the results to ensure they have the path property
+        ragResults.results = ragResults.results.map(result => {
+          // If result already has path, use it
+          if (result.path) {
+            return result;
+          }
+          
+          // Otherwise, extract path from metadata
+          if (result.metadata && result.metadata.filePath) {
+            return {
+              ...result,
+              path: result.metadata.filePath,
+              score: result.combinedScore || result.score || 0
+            };
+          }
+          
+          // If no path can be found, use the id as a fallback
+          return {
+            ...result,
+            path: result.id || 'Unknown file',
+            score: result.combinedScore || result.score || 0
+          };
+        });
+      } else {
+        console.log(chalk.yellow(`  [DEBUG] RAG returned no results`));
+      }
+    } catch (error) {
+      console.log(chalk.yellow(`  RAG retrieval error: ${error.message}`));
+      ragResults = { results: [] };
+    }
+    
+    // Single output showing all indexed files ranked by relevance
+    // if (ragResults && ragResults.results) {
+    //   console.log(chalk.cyan('\n  ALL Files Ranked by Relevance:'));
+      
+    //   // Show all results sorted by score
+    //   const allResults = [...ragResults.results].sort((a, b) => 
+    //     (b.score || b.combinedScore || 0) - (a.score || a.combinedScore || 0)
+    //   );
+      
+    //   allResults.forEach((file, index) => {
+    //     if (file && file.path) {
+    //       const score = file.score || file.combinedScore || 0;
+    //       console.log(chalk.cyan(`  ${index + 1}. ${file.path.replace(rootInfo.root, '')} (score: ${score.toFixed(3)})`));
+    //     }
+    //   });
+    // } else {
+    //   console.log(chalk.cyan('\n  No files found by RAG'));
+    // }
+    
+    // Process root cause file to ensure it has the path property
+    if (ragResults && ragResults.rootCauseFile) {
+      // If rootCauseFile doesn't have path, extract it from metadata
+      if (!ragResults.rootCauseFile.path && ragResults.rootCauseFile.metadata && ragResults.rootCauseFile.metadata.filePath) {
+        ragResults.rootCauseFile.path = ragResults.rootCauseFile.metadata.filePath;
+        ragResults.rootCauseFile.score = ragResults.rootCauseFile.combinedScore || ragResults.rootCauseFile.score || 0;
+      } else if (!ragResults.rootCauseFile.path) {
+        // If no path can be found, use the id as a fallback
+        ragResults.rootCauseFile.path = ragResults.rootCauseFile.id || 'Unknown file';
+        ragResults.rootCauseFile.score = ragResults.rootCauseFile.combinedScore || ragResults.rootCauseFile.score || 0;
+      }
+    }
+    
+    // If root cause file is identified, highlight it
+    if (ragResults && ragResults.rootCauseFile && ragResults.rootCauseFile.path) {
+      const rootScore = ragResults.rootCauseFile.score ? ragResults.rootCauseFile.score.toFixed(3) : 'N/A';
+      // console.log(chalk.green(`  Root cause file: ${ragResults.rootCauseFile.path} (score: ${rootScore})`));
+    }
+    console.log(); // Add empty line for better readability
     
     // If no results, return original file info
     if (!ragResults || !ragResults.results || ragResults.results.length === 0) {
