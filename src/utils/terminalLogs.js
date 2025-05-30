@@ -14,10 +14,10 @@ import { getTerminalLogPath } from './terminalLogger.js';
 
 /**
  * Read recently logged terminal output
- * @param {number} [maxLines=500] Maximum number of lines to read
+ * @param {number} [maxLines=1000] Maximum number of lines to read
  * @returns {Promise<string>} Terminal log content
  */
-export async function readTerminalLogs(maxLines = 750) {
+export async function readTerminalLogs(maxLines = 1000) {
   const terminalLogPath = getTerminalLogPath();
   
   if (!existsSync(terminalLogPath)) {
@@ -49,6 +49,19 @@ export function isLikelyRuntimeError(log) {
     /crash/i,
     /stack trace/i,
     /warning/i,
+    // Django-specific patterns
+    /Internal Server Error/i,
+    /ImportError/i,
+    /ModuleNotFoundError/i,
+    /subprocess\.CalledProcessError/i,
+    // Common Python error patterns
+    /File ".*", line \d+/,
+    /^\s+File/m,
+    // HTTP error patterns
+    /HTTP\/1\.1" 5\d\d/,
+    // General error indicators
+    /returned non-zero exit status/i,
+    /broken pipe/i,
   ];
   
   return errorPatterns.some(pattern => pattern.test(log));
@@ -56,14 +69,14 @@ export function isLikelyRuntimeError(log) {
 
 /**
  * Extract the most recent error from terminal logs
- * @returns {Promise<{error: string, files: Map<string, number>}>} Extracted error and related files
+ * @returns {Promise<{error: string, files: Map<string, number>, wasInterrupted: boolean}>} Extracted error and related files
  */
 export async function extractRecentError() {
-  const logs = await readTerminalLogs();
+  const logs = await readTerminalLogs(1500); // Increase lines to capture longer error blocks
   
   // No logs available
   if (!logs) {
-    return { error: '', files: new Map() };
+    return { error: '', files: new Map(), wasInterrupted: false };
   }
   
   // Split into "command blocks" using the consistent separator
@@ -72,8 +85,13 @@ export async function extractRecentError() {
     .filter(block => block.trim() !== "" && block.includes("COMMAND:"));
   
   // Look through recent command blocks for errors, starting from the most recent
-  for (let i = commandBlocks.length - 1; i >= 0; i--) {
+  // Special handling for Ctrl+C scenarios with multiple blocks
+  for (let i = commandBlocks.length - 1; i >= Math.max(0, commandBlocks.length - 3); i--) {
     const block = commandBlocks[i];
+    
+    // Check if this was an interrupted command
+    const wasInterrupted = block.includes("=== INTERRUPTED BY USER (Ctrl+C) ===") || 
+                          block.includes("EXIT STATUS: 130");
     
     // Extract the part of the block that is the actual command output
     const outputHeader = "OUTPUT BEGINS BELOW:\n---------------------------------------------------\n";
@@ -87,20 +105,49 @@ export async function extractRecentError() {
                         outputContent.substring(0, outputEndIndex) : 
                         outputContent;
       
-      if (isLikelyRuntimeError(pureOutput)) {
-        // We found a likely error block, now extract file references
+      // For interrupted commands, check if this block has substantial error content
+      if (wasInterrupted) {
+        // Skip blocks that are nearly empty (just "Watching for file changes" or similar)
+        const contentLines = pureOutput.trim().split('\n').filter(line => {
+          const trimmed = line.trim();
+          return trimmed && 
+                 !trimmed.startsWith('Watching for file changes') &&
+                 !trimmed.match(/^\[[0-9\/]+\s+[0-9:]+\]\s*===\s*INTERRUPTED/);
+        });
         
+        // If this block has substantial content (more than 3 meaningful lines), use it
+        // OR if it contains obvious error patterns
+        if (contentLines.length > 3 || isLikelyRuntimeError(pureOutput)) {
+          // Import the traceback analyzer
+          const { extractFilesFromTraceback } = await import('./traceback.js');
+          const files = extractFilesFromTraceback(pureOutput);
+          
+          return {
+            error: pureOutput,
+            files: files,
+            wasInterrupted: true
+          };
+        }
+        
+        // If this is a nearly empty interrupted block, continue to check previous blocks
+        // This handles the case where user pressed Ctrl+C twice
+        continue;
+      }
+      
+      // For non-interrupted commands, use existing error detection logic
+      if (isLikelyRuntimeError(pureOutput)) {
         // Import the traceback analyzer
         const { extractFilesFromTraceback } = await import('./traceback.js');
         const files = extractFilesFromTraceback(pureOutput);
         
         return {
-          error: pureOutput, // Return just the command output part as the error
-          files: files
+          error: pureOutput,
+          files: files,
+          wasInterrupted: false
         };
       }
     }
   }
   
-  return { error: '', files: new Map() };
+  return { error: '', files: new Map(), wasInterrupted: false };
 } 
