@@ -78,28 +78,44 @@ const __dirname = dirname(__filename);
 async function interactiveLoop(initialCmd, limit, initialModel) {
     let lastCmd = initialCmd;
     let currentModel = initialModel;
+    let userContext = ''; // Store user's context/request
   
     while (true) {
       closeReadline(); // Ensure clean state before each iteration
       console.log(boxen(
-        `${chalk.gray('Type a command')} (${chalk.blue('/debug')}, ${chalk.blue('/model')}, ${chalk.blue('/logging')}, ${chalk.blue('/help')})`,
+        `${chalk.gray('Describe what you want to do, or use commands:')} (${chalk.blue('/debug')}, ${chalk.blue('/model')}, ${chalk.blue('/help')})`,
         BOX.PROMPT
       ));
       // Add improved gray text below the boxen prompt for exit instructions and /debug info
-      console.log(chalk.gray('  Use /debug to analyze and auto-fix the last command. Press ctrl+c to exit.'));
+      console.log(chalk.gray('  Describe your goal or use /debug to analyze and auto-fix the last command. Press ctrl+c to exit.'));
   
       const input = await new Promise(r => {
         const rl = getReadline();
         rl.question('> ', t => {
           closeReadline(); // Clean up after getting input
-          r(t.trim().toLowerCase());
+          r(t.trim());
         });
       });
+
+      // Check if input is a command or user context
+      const isCommand = input.toLowerCase().startsWith('/');
+      
+      if (!isCommand && input) {
+        // Store user context and automatically trigger debug
+        userContext = input;
+        console.log(boxen(`User context: ${userContext}`, { ...BOX.OUTPUT, title: 'Context Set' }));
+        process.stdout.write('\n');
+        await debugLoop(lastCmd, limit, currentModel, userContext);
+        process.stdout.write('\n');
+        continue;
+      }
+
+      const command = input.toLowerCase();
   
-      switch (input) {
+      switch (command) {
         case '/debug': {
           process.stdout.write('\n');
-          await debugLoop(lastCmd, limit, currentModel);
+          await debugLoop(lastCmd, limit, currentModel, userContext);
           process.stdout.write('\n');
           break;
         }
@@ -133,51 +149,12 @@ async function interactiveLoop(initialCmd, limit, initialModel) {
           break;
         }
         
-        case '/logging': {
-          if (!process.env.SHELL || !process.env.SHELL.includes('zsh')) {
-            console.log(boxen(
-              `Terminal logging is only supported for zsh shell.\nYour current shell is: ${process.env.SHELL || 'unknown'}\n\nCLOI will still work but without auto-logging capabilities.`,
-              { ...BOX.OUTPUT, title: 'Shell Not Supported' }
-            ));
-            break;
-          }
-          
-          const { isLoggingEnabled, setupTerminalLogging, disableLogging } = await import('../utils/terminalLogger.js');
-          const loggingEnabled = await isLoggingEnabled();
-          
-          if (loggingEnabled) {
-            console.log(boxen(
-              `Terminal logging is currently enabled.\nDo you want to disable it?`,
-              { ...BOX.CONFIRM, title: 'Logging Status' }
-            ));
-            
-            const shouldDisable = await askYesNo('Disable terminal logging?');
-            if (shouldDisable) {
-              const success = await disableLogging();
-              console.log('\n');
-              if (success) {
-                console.log(boxen(
-                  `Terminal logging has been disabled.\nPlease restart your terminal or run 'source ~/.zshrc' for changes to take effect.`,
-                  { ...BOX.OUTPUT, title: 'Success' }
-                ));
-              } else {
-                console.log(chalk.red('Failed to disable terminal logging.'));
-              }
-            }
-          } else {
-            const uiTools = { askYesNo, askInput, closeReadline };
-            await setupTerminalLogging(uiTools, false);
-          }
-          break;
-        }
-
         case '/help':
           console.log(boxen(
             [
               '/debug    – auto-patch errors using chosen LLM',
               '/model    – pick from installed Ollama models',
               // '/history  – pick from recent shell commands', // Hidden from help
-              '/logging  – enable/disable terminal output logging (zsh only)',
               '/help     – show this help',
               // '/exit     – quit' // Remove from help
             ].join('\n'),
@@ -187,7 +164,7 @@ async function interactiveLoop(initialCmd, limit, initialModel) {
   
         case '':
           break;
-  
+
         default:
           console.log(chalk.red('Unknown command. Type'), chalk.bold('/help'));
       }
@@ -208,8 +185,9 @@ async function interactiveLoop(initialCmd, limit, initialModel) {
  * @param {string} initialCmd - The command to start debugging.
  * @param {number} limit - History limit (passed down from interactive loop/args).
  * @param {string} currentModel - The Ollama model to use.
+ * @param {string} userContext - The user's context/request for debugging.
  */
-async function debugLoop(initialCmd, limit, currentModel) {
+async function debugLoop(initialCmd, limit, currentModel, userContext = '') {
     const iterations = [];
     const ts = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 15);
     const logDir = join(__dirname, 'debug_history');
@@ -232,59 +210,11 @@ async function debugLoop(initialCmd, limit, currentModel) {
     
     // First, try to extract recent errors from terminal logs
   let cmd = initialCmd;
-  console.log(chalk.gray('  Looking for recent errors in terminal logs...\n'));
+  console.log(chalk.gray('  Running command...\n'));
   
-  // Import and use the terminal log reader and logger
-  const { readTerminalLogs, extractRecentError, isLikelyRuntimeError } = await import('../utils/terminalLogs.js');
-  const { isLoggingEnabled } = await import('../utils/terminalLogger.js');
-  
-  // Check if terminal logging is enabled (for zsh users)
-  const loggingEnabled = process.env.SHELL?.includes('zsh') ? await isLoggingEnabled() : false;
-  
-  // Try to get error from logs first
-  const { error: logError, files: logFiles } = await extractRecentError();
-  
-  // Variables to store final error output
-  let ok = true;
-  let output = '';
-  
-  // If we found a likely runtime error in logs
-  if (logError && logFiles.size > 0) {
-    console.log(chalk.gray(`  Detected error when running: ${initialCmd}\n`));
-    
-    
-    // // List all files that caused the error
-    // if (logFiles.size > 0) {
-    //   console.log(chalk.gray('Files with errors:'));
-    //   for (const file of logFiles.keys()) {
-    //     console.log(chalk.gray(`  - ${file}`));
-    //   }
-    // }
-    
-    // Show the last 5 lines of the traceback error
-    const errorLines = logError.split('\n');
-    const lastFiveLines = errorLines.slice(Math.max(0, errorLines.length - 4));
-    
-    // Add simple dividers to indicate error section
-    console.log(chalk.gray('  ─────────── Error ───────────'));
-    lastFiveLines.forEach(line => console.log(chalk.gray(`  ${line}`)));
-    
-    output = logError;
-    ok = false; // Mark as error since we found one
-  } else {
-    // If logging is not enabled and this is a zsh shell, suggest enabling it
-    if (!loggingEnabled && process.env.SHELL?.includes('zsh')) {
-      console.log(boxen(
-        chalk.gray('Tip: For better error detection, enable terminal logging using the /logging command.\nThis only works with zsh shell and requires a terminal restart to take effect.'),
-        { ...BOX.OUTPUT_DARK, title: 'Suggestion' }
-      ));
-    }
-    
-    // Fall back to running the command if no clear error found in logs
-    console.log(chalk.gray('  Terminal logging is disabled. Running command instead...'));
-    echoCommand(cmd);
-    ({ ok, output } = runCommand(cmd));
-  }
+  // Run the command
+  echoCommand(cmd);
+  const { ok, output } = runCommand(cmd);
   
   if (ok && !/error/i.test(output)) {
     console.log(boxen(chalk.green('No errors detected.'), { ...BOX.OUTPUT, title: 'Success' }));
@@ -293,48 +223,32 @@ async function debugLoop(initialCmd, limit, currentModel) {
     
     // Extract possible file paths from the command or error logs
       try {
-    // If we extracted error from logs and have file paths already, use those
-    if (logError && logFiles && logFiles.size > 0) {
-      // Use the first file from the logs
-      filePath = Array.from(logFiles.keys())[0];
-
-      
-              // Check if it's a valid file
-        isValidSourceFile = filePath && fs.existsSync(filePath) && fs.statSync(filePath).isFile();
-        
-        // If not a file, try as absolute path
-        if (!isValidSourceFile && filePath && !filePath.startsWith('/')) {
-        filePath = join(currentDir.trim(), filePath);
-        isValidSourceFile = fs.existsSync(filePath) && fs.statSync(filePath).isFile();
+    // Extract possible filename from commands like "python file.py", "node script.js", etc.
+    let possibleFile = initialCmd;
+    
+    // Common command prefixes to check for
+    const commandPrefixes = ['python', 'python3', 'node', 'ruby', 'perl', 'php', 'java', 'javac', 'bash', 'sh'];
+    
+    // Check if the command starts with any of the common prefixes
+    for (const prefix of commandPrefixes) {
+      if (initialCmd.startsWith(prefix + ' ')) {
+        // Extract everything after the prefix and a space
+        possibleFile = initialCmd.substring(prefix.length + 1).trim();
+        break;
       }
-    } else {
-      // Extract possible filename from commands like "python file.py", "node script.js", etc.
-      let possibleFile = initialCmd;
-      
-      // Common command prefixes to check for
-      const commandPrefixes = ['python', 'python3', 'node', 'ruby', 'perl', 'php', 'java', 'javac', 'bash', 'sh'];
-      
-      // Check if the command starts with any of the common prefixes
-      for (const prefix of commandPrefixes) {
-        if (initialCmd.startsWith(prefix + ' ')) {
-          // Extract everything after the prefix and a space
-          possibleFile = initialCmd.substring(prefix.length + 1).trim();
-          break;
-        }
-      }
-      
-      // Further extract arguments if present (get first word that doesn't start with -)
-      possibleFile = possibleFile.split(' ').find(part => part && !part.startsWith('-')) || '';
-      
-      // First check relative path
-      filePath = possibleFile;
-      isValidSourceFile = filePath && fs.existsSync(filePath) && fs.statSync(filePath).isFile();
-      
-      // If not a file, try as absolute path
-      if (!isValidSourceFile && filePath && !filePath.startsWith('/')) {
-        filePath = join(currentDir.trim(), filePath);
-        isValidSourceFile = fs.existsSync(filePath) && fs.statSync(filePath).isFile();
-      }
+    }
+    
+    // Further extract arguments if present (get first word that doesn't start with -)
+    possibleFile = possibleFile.split(' ').find(part => part && !part.startsWith('-')) || '';
+    
+    // First check relative path
+    filePath = possibleFile;
+    isValidSourceFile = filePath && fs.existsSync(filePath) && fs.statSync(filePath).isFile();
+    
+    // If not a file, try as absolute path
+    if (!isValidSourceFile && filePath && !filePath.startsWith('/')) {
+      filePath = join(currentDir.trim(), filePath);
+      isValidSourceFile = fs.existsSync(filePath) && fs.statSync(filePath).isFile();
     }
     
     // Check if we need additional context from the file
@@ -402,7 +316,9 @@ async function debugLoop(initialCmd, limit, currentModel) {
           path: filePath 
         },
         codeSummary, 
-        filePath
+        filePath,
+        'error_analysis',
+        userContext
       );
       
       // Display reasoning if available
@@ -418,7 +334,7 @@ async function debugLoop(initialCmd, limit, currentModel) {
       // Determine if this is a terminal command issue using LLM
       // Determine error type without displaying the prompt
       
-      const errorType = await determineErrorType(output, analysis, currentModel);
+      const errorType = await determineErrorType(output, analysis, currentModel, userContext);
       // Display error type as indented gray text
       console.log('  ' + chalk.gray(errorType) + '\n');
       
@@ -428,7 +344,7 @@ async function debugLoop(initialCmd, limit, currentModel) {
         
         // Generate command fix without displaying the prompt
         
-        const { command: newCommand, reasoning: cmdReasoning } = await generateTerminalCommandFix(prevCommands, analysis, currentModel);
+        const { command: newCommand, reasoning: cmdReasoning } = await generateTerminalCommandFix(prevCommands, analysis, currentModel, userContext);
         
         // Display command reasoning if available
         if (cmdReasoning) {
@@ -476,7 +392,8 @@ async function debugLoop(initialCmd, limit, currentModel) {
             end: fileContentRaw ? fileContentRaw.split('\n').length : 0, 
             path: filePath 
           },
-          codeSummary
+          codeSummary,
+          userContext
         );
         
         // Display patch reasoning if available
@@ -541,31 +458,9 @@ async function debugLoop(initialCmd, limit, currentModel) {
         default: null,
         type: 'string'
       })
-      .option('setup-logging', {
-        describe: 'Set up automatic terminal logging',
-        type: 'boolean'
-      })
       .help().alias('help', '?')
       .epilog('CLOI - Open source and completely local debugging agent.')
       .parse();
-    
-    // Check if user explicitly requested to set up terminal logging
-    if (argv.setupLogging) {
-      const { setupTerminalLogging } = await import('../utils/terminalLogger.js');
-      const { askYesNo, askInput, closeReadline } = await import('../ui/terminalUI.js');
-      const uiTools = { askYesNo, askInput, closeReadline };
-      // Show model selection during explicit setup
-      const setupResult = await setupTerminalLogging(uiTools, true);
-      if (!setupResult) {
-        console.log(chalk.gray('Terminal logging setup was not completed.'));
-      } else {
-        console.log(boxen(
-          chalk.green('Terminal logging has been enabled.\nAfter restarting your terminal, ALL commands will be automatically logged without any prefix.'),
-          { ...BOX.OUTPUT, title: 'Success' }
-        ));
-      }
-      process.exit(0);
-    }
   
     // Load default model from config or use command line argument if provided
     let currentModel;
@@ -618,29 +513,6 @@ async function debugLoop(initialCmd, limit, currentModel) {
       `${banner}\n↳ model: ${currentModel}\n↳ completely local and secure`,
       BOX.WELCOME
     ));
-    
-    // Check if terminal logging should be set up (only for zsh users)
-    if (process.env.SHELL && process.env.SHELL.includes('zsh')) {
-      const { isLoggingEnabled, setupTerminalLogging } = await import('../utils/terminalLogger.js');
-      
-      // Only prompt if logging is not already enabled
-      if (!(await isLoggingEnabled())) {
-        try {
-          const uiTools = { askYesNo, askInput, closeReadline };
-          // Show model selection during first-run setup
-          const setupResult = await setupTerminalLogging(uiTools, true);
-          
-          // If user gave permission to set up logging, ensure clean exit
-          if (setupResult) {
-            // Process will exit in setupTerminalLogging
-            return;
-          }
-        } catch (error) {
-          console.error(chalk.red(`Error during setup: ${error.message}`));
-          // Continue with normal execution if setup fails
-        }
-      }
-    }
   
     const lastCmd = await lastRealCommand();
     if (!lastCmd) {

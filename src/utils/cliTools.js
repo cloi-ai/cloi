@@ -10,6 +10,7 @@
  */
 
 import { execSync } from 'child_process';
+import { spawn } from 'child_process';
 import { promises as fs } from 'fs';
 import { join, dirname } from 'path';
 
@@ -23,11 +24,64 @@ import { join, dirname } from 'path';
  */
 export function runCommand(cmd, timeout = 10000) {
   try {
-    const out = execSync(`${cmd} 2>&1`, { encoding: 'utf8', timeout });
+    // Use the user's actual shell for better compatibility
+    const shell = process.env.SHELL || '/bin/bash';
+    
+    // For pip install and similar commands, we want them to run in the user's environment
+    // Use inherit stdio for interactive commands like pip that might need user input
+    const options = {
+      encoding: 'utf8',
+      timeout,
+      shell: shell,
+      stdio: 'pipe' // Use pipe to capture output but allow interaction if needed
+    };
+    
+    console.log(`Executing: ${cmd}`);
+    const out = execSync(`${cmd} 2>&1`, options);
     return { ok: true, output: out };
   } catch (e) {
-    return { ok: false, output: e.stdout?.toString() || e.message };
+    // Better error handling for different types of failures
+    const errorOutput = e.stdout?.toString() || e.stderr?.toString() || e.message;
+    console.log(`Command failed with error: ${errorOutput}`);
+    return { ok: false, output: errorOutput };
   }
+}
+
+/**
+ * Runs a command interactively in the user's terminal environment.
+ * This is specifically for commands that need to persist (like pip install, npm install)
+ * and may require user interaction.
+ * @param {string} cmd - The command to execute.
+ * @returns {Promise<{ok: boolean, output: string}>} - Promise resolving to execution result.
+ */
+export function runInteractiveCommand(cmd) {
+  return new Promise((resolve) => {
+    console.log(`Running interactively: ${cmd}`);
+    
+    // Split command into parts for spawn
+    const parts = cmd.trim().split(/\s+/);
+    const command = parts[0];
+    const args = parts.slice(1);
+    
+    // Use spawn with inherit stdio so it runs in the user's actual terminal
+    const child = spawn(command, args, {
+      stdio: 'inherit', // This allows the command to run in the actual terminal
+      shell: true,
+      env: process.env // Use the full environment
+    });
+    
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ ok: true, output: `Command completed successfully` });
+      } else {
+        resolve({ ok: false, output: `Command exited with code ${code}` });
+      }
+    });
+    
+    child.on('error', (error) => {
+      resolve({ ok: false, output: `Failed to start command: ${error.message}` });
+    });
+  });
 }
 
 /* ───────────────────────── Network Connectivity Check ────────────────────────────── */

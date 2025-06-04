@@ -17,6 +17,7 @@
  * @param {string} errorLines - Line numbers with errors
  * @param {string} exactErrorCode - Exact code with errors
  * @param {string} context - Error context
+ * @param {string} userContext - User's context/request for debugging
  * @returns {string} - The formatted prompt
  */
 export function buildPatchPrompt(
@@ -29,7 +30,8 @@ export function buildPatchPrompt(
   errorFiles = '',
   errorLines = '',
   exactErrorCode = '',
-  context = ''
+  context = '',
+  userContext = ''
 ) {
   const prevPatchesText = prevPatches.length
     ? `\n\nPreviously attempted patches:\n${prevPatches.join('\n\n')}`
@@ -53,7 +55,7 @@ Analyze the error and generate a structured patch in JSON format with the follow
     ...
   ]
 }
-
+${userContext ? `\nUser Request:\n${userContext}\n` : ''}
 Error Analysis:
 ${analysis}
 
@@ -97,7 +99,7 @@ Make sure to:
 2. Use the correct line numbers from the error traceback (line ${errorLines || '?'})
 3. Keep the changes as minimal as possible
 4. Return ONLY valid JSON with no explanations or extra text
-
+${userContext ? '5. Ensure the patch aligns with the user\'s request and goals\n' : ''}
 Return ONLY the JSON object with no additional text or code blocks.
 `.trim();
 } 

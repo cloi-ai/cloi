@@ -17,19 +17,28 @@
  * @param {string} codeSummary - Optional code summary
  * @param {string} filePath - Optional file path
  * @param {string} context - Optional traceback context
+ * @param {string} userContext - User's context/request for debugging
  * @returns {string} - The formatted prompt
  */
-export function buildAnalysisPrompt(errorOutput, fileInfo = {}, codeSummary = '', filePath = '', context = '') {
+export function buildAnalysisPrompt(errorOutput, fileInfo = {}, codeSummary = '', filePath = '', context = '', userContext = '') {
   // Build the prompt with additional context
   let promptParts = [
     'You are a helpful terminal assistant analysing command errors.',
     '',
-    'ERROR OUTPUT:',
-    errorOutput,
-    '',
-    'FILE PATH:',
-    filePath,
   ];
+
+  // Add user context if provided
+  if (userContext) {
+    promptParts.push('USER REQUEST:');
+    promptParts.push(userContext);
+    promptParts.push('');
+  }
+
+  promptParts.push('ERROR OUTPUT:');
+  promptParts.push(errorOutput);
+  promptParts.push('');
+  promptParts.push('FILE PATH:');
+  promptParts.push(filePath);
   
   // Add code summary if provided
   if (codeSummary) {
@@ -60,6 +69,11 @@ export function buildAnalysisPrompt(errorOutput, fileInfo = {}, codeSummary = ''
   promptParts.push('1. ERROR LOCATION: Specify the file name (example.py) and the exact line number (line 45) where you believe the error is occurring. Nothing else.');
   promptParts.push('2. Explain **VERY** concisely what went wrong.');
   promptParts.push('3. FIX: Propose a concrete solution to fix the error. There might be multiple fixes required for the same error, so put all in one code chunk. Do not move onto another error. No alternatives. Be final with your solution.');
+  
+  if (userContext) {
+    promptParts.push('4. Consider the user\'s request above when proposing the fix to ensure it aligns with their goals.');
+  }
+  
   promptParts.push('');
   promptParts.push('Be precise about the error line number, even if it\'s not explicitly mentioned in the traceback.');
   promptParts.push('No to low explanation only and focused on the root cause and solution. Keep it **VERY** concise.');
