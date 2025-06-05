@@ -355,6 +355,67 @@ function isTerminalCommandError(errorOutput) {
   return terminalErrors.some(pattern => pattern.test(errorOutput));
 }
 
+/**
+ * Determines the next action for the agentic debugging assistant
+ * @param {Object} agentContext - The current context of the debugging session
+ * @param {string} model - The model to use for decision making
+ * @param {number} maxRetries - Maximum number of retry attempts
+ * @returns {Promise<{thought: string, tool_to_use: string, tool_parameters: Object}>} - The agent's chosen action
+ */
+export async function determineNextAgentAction(agentContext, model, maxRetries = 3) {
+  const { buildAgentPrompt, validateAgentAction, AGENT_ACTION_SCHEMA } = await import('./agent_prompt.js');
+  const stopThinking = startThinking(['🤖 Agent thinking...', '🔍 Analyzing context...', '⚡ Planning next action...']);
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await ensureModelAvailable(model);
+      
+      // Build the prompt for the agent
+      const prompt = buildAgentPrompt(agentContext);
+      
+      // Call the LLM with structured output
+      const result = await routeStructuredQuery(prompt, model, AGENT_ACTION_SCHEMA, {
+        temperature: 0.1,
+        max_tokens: 256
+      });
+      
+      stopThinking();
+      
+      // Validate the response
+      if (!validateAgentAction(result)) {
+        throw new Error(`Invalid action format: ${JSON.stringify(result)}`);
+      }
+      
+      // Validate tool exists
+      const { AVAILABLE_TOOLS } = await import('./agent_tools.js');
+      const availableTools = AVAILABLE_TOOLS.map(t => t.name);
+      if (!availableTools.includes(result.tool_to_use)) {
+        throw new Error(`Unknown tool: ${result.tool_to_use}`);
+      }
+      
+      return result;
+      
+    } catch (error) {
+      console.log(chalk.yellow(`Agent decision attempt ${attempt} failed: ${error.message}`));
+      
+      if (attempt === maxRetries) {
+        stopThinking();
+        // Fallback: return a safe diagnostic action
+        return {
+          thought: `Failed to get valid agent decision after ${maxRetries} attempts. Asking user for guidance.`,
+          tool_to_use: "ask_user_for_clarification",
+          tool_parameters: {
+            question_for_user: `I encountered an error making a decision: ${error.message}. Could you please describe what you'd like me to do next?`
+          }
+        };
+      }
+      
+      // Wait before retry
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
 // Export model management functions
 export {
   getAllAvailableModels,

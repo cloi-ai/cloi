@@ -297,9 +297,11 @@ export function convertToUnifiedDiff(patchData, currentDir) {
     // Sort changes by line number
     changes.sort((a, b) => a.line_number - b.line_number);
     
-    // Add file headers
-    diffOutput += `--- a/${filePath}\n`;
-    diffOutput += `+++ b/${filePath}\n`;
+    // Add file headers with proper relative paths
+    // Remove any leading path separators to ensure relative paths
+    const cleanFilePath = filePath.replace(/^\/+/, '');
+    diffOutput += `--- ${cleanFilePath}\n`;
+    diffOutput += `+++ ${cleanFilePath}\n`;
     
     // Generate hunks
     const hunks = generateHunks(changes, filePath);

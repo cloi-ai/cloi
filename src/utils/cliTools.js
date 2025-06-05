@@ -125,13 +125,20 @@ export async function writeDebugLog(historyArr, logPath) {
   // Ensure the parent directory exists
   await ensureDir(dirname(logPath));
   
-  const content = historyArr.map((iteration, i) => {
-    return `=== ITERATION ${i + 1} ===\n\n` +
-           `ERROR:\n${iteration.error}\n\n` +
-           `ANALYSIS:\n${iteration.analysis}\n\n` +
-           `PATCH:\n${iteration.patch}\n\n` +
-           '='.repeat(50) + '\n\n';
-  }).join('');
-  
-  await fs.writeFile(logPath, content, 'utf8');
+  // Check if this is a JSON log (agentic session) or text log (legacy)
+  if (logPath.endsWith('.json')) {
+    // Write as JSON for agentic sessions
+    await fs.writeFile(logPath, JSON.stringify(historyArr, null, 2), 'utf8');
+  } else {
+    // Write as text for legacy sessions
+    const content = historyArr.map((iteration, i) => {
+      return `=== ITERATION ${i + 1} ===\n\n` +
+             `ERROR:\n${iteration.error}\n\n` +
+             `ANALYSIS:\n${iteration.analysis}\n\n` +
+             `PATCH:\n${iteration.patch}\n\n` +
+             '='.repeat(50) + '\n\n';
+    }).join('');
+    
+    await fs.writeFile(logPath, content, 'utf8');
+  }
 } 

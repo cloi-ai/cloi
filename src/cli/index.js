@@ -48,12 +48,22 @@ import {
   summarizeCodeWithLLM, 
   getInstalledModels as readModels, 
   getAllAvailableModels as getAvailableModels,
-  installModelIfNeeded as installModel
+  installModelIfNeeded as installModel,
+  determineNextAgentAction
 } from '../core/index.js';
 import { extractDiff, confirmAndApply } from '../utils/patch.js';
 import { displaySnippetsFromError, readFileContext, extractFilesFromTraceback, buildErrorContext, getErrorLines } from '../utils/traceback.js';
 import { startThinking } from '../core/ui/thinking.js';
-// Import prompt builders for debugging
+// Import agentic system components
+import { executeAgentTool } from '../core/agent_tools.js';
+import { 
+  createInitialAgentContext, 
+  updateAgentContext, 
+  createSessionSummary,
+  shouldTerminateSession,
+  updateErrorState
+} from '../core/agent_prompt.js';
+// Import prompt builders for debugging (kept for legacy support)
 import { buildAnalysisPrompt, buildSummaryPrompt } from '../core/promptTemplates/analyze.js';
 import { buildErrorTypePrompt } from '../core/promptTemplates/classify.js';
 import { buildCommandFixPrompt } from '../core/promptTemplates/command.js';
@@ -171,275 +181,215 @@ async function interactiveLoop(initialCmd, limit, initialModel) {
     }
   }
 
-/* ───────────────  Debug loop  ─────────────── */
+/* ───────────────  Agentic Debug loop  ─────────────── */
 /**
- * Main debugging loop that analyzes errors and fixes them.
- * 1. Runs the current command (`cmd`).
- * 2. If successful, breaks the loop.
- * 3. If error, analyzes the error (`analyzeWithLLM`).
- * 4. Determines error type (`determineErrorType`).
- * 5. If Terminal Issue: generates a new command (`generateTerminalCommandFix`), confirms with user, updates `cmd`.
- * 6. If Code Issue: generates a patch (`generatePatch`), confirms and applies (`confirmAndApply`).
- * 7. Logs the iteration details (`writeDebugLog`).
- * Continues until the command succeeds or the user cancels.
- * @param {string} initialCmd - The command to start debugging.
- * @param {number} limit - History limit (passed down from interactive loop/args).
- * @param {string} currentModel - The Ollama model to use.
+ * Agentic debugging loop that uses an LLM agent to iteratively diagnose and fix issues.
+ * The agent chooses tools and actions based on the current context and progresses
+ * autonomously until the issue is resolved or cannot be fixed.
+ * @param {string} initialCmd - The command that triggered the debugging session.
+ * @param {number} limit - History limit (for legacy compatibility).
+ * @param {string} currentModel - The Ollama model to use for the agent.
  * @param {string} userContext - The user's context/request for debugging.
  */
 async function debugLoop(initialCmd, limit, currentModel, userContext = '') {
-    const iterations = [];
+  try {
+    // Get current working directory
+    console.log(chalk.gray('  Starting agentic debugging session...'));
+    const currentDir = process.cwd();
+    
+    // Run the initial command to get error details
+    console.log(chalk.gray('  Running initial command...'));
+    echoCommand(initialCmd);
+    const { ok, output } = runCommand(initialCmd);
+    
+    // Check if command succeeded
+    if (ok && !/error/i.test(output)) {
+      console.log(boxen(chalk.green('No errors detected.'), { ...BOX.OUTPUT, title: 'Success' }));
+      return;
+    }
+    
+    // Create initial agent context
+    const commandDetails = {
+      command_string: initialCmd,  // Fixed: was 'command', should be 'command_string'
+      stdout: ok ? output : '',
+      stderr: ok ? '' : output,
+      exit_code: ok ? 0 : 1
+    };
+    
+    let agentContext = createInitialAgentContext(
+      userContext,
+      commandDetails, 
+      currentDir
+    );
+    
+    // NEW: Set initial error state from the command output
+    if (!ok && output) {
+      agentContext = updateErrorState(agentContext, output, 0);
+    }
+    
+    // Note: Removed premature file reading - let the agent decide what to investigate
+    
+    console.log(boxen(
+      `Agent initialized with ${agentContext.available_tools.length} tools available`,
+      { ...BOX.OUTPUT, title: 'Agentic Debugging Started' }
+    ));
+    
+    let stepCount = 0;
+    const maxSteps = 20;
+    
+    // Main agentic loop
+    while (stepCount < maxSteps) {
+      stepCount++;
+      
+      // Check if we should terminate the session
+      const terminationCheck = shouldTerminateSession(agentContext);
+      if (terminationCheck.should_terminate) {
+        console.log(boxen(
+          `Session terminated: ${terminationCheck.reason}`,
+          { ...BOX.OUTPUT, title: 'Session Ended' }
+        ));
+        break;
+      }
+      
+      console.log(chalk.blue(`\n--- Agent Step ${stepCount} ---`));
+      
+      try {
+        // NEW: Show progress visualization if not first step
+        if (stepCount > 1) {
+          const progressStatus = getProgressStatus(agentContext);
+          console.log(chalk.blue(`Progress: ${progressStatus}`));
+        }
+        
+        // Let the agent determine the next action
+        const agentAction = await determineNextAgentAction(agentContext, currentModel);
+        
+        // Calculate context usage
+        const { buildAgentPrompt } = await import('../core/agent_prompt.js');
+        const currentPrompt = buildAgentPrompt(agentContext);
+        const estimatedTokens = Math.ceil(currentPrompt.length / 4); // Rough estimate: 4 chars = 1 token
+        const maxTokens = 8000; // Model context limit
+        const remainingTokens = maxTokens - estimatedTokens;
+        const contextUsage = Math.round((estimatedTokens / maxTokens) * 100);
+        
+        // Display agent's thought process with context info
+        console.log(boxen(
+          `Tool: ${chalk.bold(agentAction.tool_to_use)}\nThought: ${agentAction.thought}\n\n` +
+          `${chalk.gray(`Context: ${estimatedTokens}/${maxTokens} tokens (${contextUsage}%) | ${remainingTokens} remaining`)}`,
+          { ...BOX.OUTPUT_DARK, title: 'Agent Decision' }
+        ));
+        
+        // Execute the chosen tool
+        const toolResult = await executeAgentTool(
+          agentAction.tool_to_use,
+          agentAction.tool_parameters,
+          agentContext
+        );
+        
+        // Display tool result (brief summary)
+        if (toolResult.status === 'success') {
+          console.log(chalk.green(`✓ ${agentAction.tool_to_use} completed successfully`));
+        } else if (toolResult.status === 'error') {
+          console.log(chalk.red(`✗ ${agentAction.tool_to_use} failed: ${toolResult.message}`));
+        } else if (toolResult.status === 'finished') {
+          console.log(chalk.green(`✓ Debugging session completed`));
+          break;
+        } else if (toolResult.status === 'skipped') {
+          console.log(chalk.yellow(`⏭ ${agentAction.tool_to_use} skipped: ${toolResult.message}`));
+        }
+        
+        // Update agent context with the action and result
+        agentContext = updateAgentContext(
+          agentContext,
+          stepCount,
+          agentAction.thought,
+          {
+            tool_used: agentAction.tool_to_use,
+            tool_to_use: agentAction.tool_to_use,
+            parameters: agentAction.tool_parameters
+          },
+          toolResult
+        );
+        
+        // NEW: Update error state if we ran a diagnostic command
+        if (agentAction.tool_to_use === 'run_diagnostic_command' && toolResult.stderr) {
+          agentContext = updateErrorState(agentContext, toolResult.stderr, stepCount);
+        }
+        
+        // Special handling for finish_debugging tool
+        if (agentAction.tool_to_use === 'finish_debugging') {
+          break;
+        }
+        
+        // Brief pause to make the process observable
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+      } catch (error) {
+        console.error(chalk.red(`Error in agent step ${stepCount}: ${error.message}`));
+        
+        // Try to recover by asking user for guidance
+        try {
+          const fallbackAction = {
+            tool_to_use: 'ask_user_for_clarification',
+            tool_parameters: {
+              question_for_user: `I encountered an error: ${error.message}. How would you like me to proceed?`
+            }
+          };
+          
+          const userGuidance = await executeAgentTool(
+            fallbackAction.tool_to_use,
+            fallbackAction.tool_parameters,
+            agentContext
+          );
+          
+          agentContext = updateAgentContext(
+            agentContext,
+            stepCount,
+            `Recovery attempt after error: ${error.message}`,
+            fallbackAction,
+            userGuidance
+          );
+          
+        } catch (recoveryError) {
+          console.error(chalk.red('Failed to recover from error. Ending session.'));
+          break;
+        }
+      }
+    }
+    
+    // Show session summary
+    const summary = createSessionSummary(agentContext);
+    console.log(boxen(
+      `Session completed in ${summary.steps_taken} steps\n` +
+      `Tools used: ${summary.tools_used.join(', ')}\n` +
+      `Files analyzed: ${summary.files_analyzed}`,
+      { ...BOX.OUTPUT, title: 'Session Summary' }
+    ));
+    
+    // Save session log
     const ts = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 15);
     const logDir = join(__dirname, 'debug_history');
     await ensureDir(logDir);
-    const logPath = join(logDir, `${ts}.txt`);
-  
-    // Get current working directory for context
-    console.log(chalk.gray('  Locating current working directory...'));
-    echoCommand('pwd');
-    const { output: currentDir } = runCommand('pwd');
+    const logPath = join(logDir, `agent_session_${ts}.json`);
     
-    // Initialize file content and summary variables outside try-catch scope
-    let fileContentRaw = '';
-    let fileContentWithLineNumbers = '';
-    let codeSummary = '';
-    let filePath = '';
-    let isValidSourceFile = false; // Track if we have a valid source file
-    // Initialize fileInfo with default values
-    let fileInfo = null;
+    try {
+      await writeDebugLog([{
+        session_type: 'agentic',
+        timestamp: ts,
+        initial_command: initialCmd,
+        user_context: userContext,
+        final_context: agentContext,
+        steps_taken: stepCount
+      }], logPath.replace('.txt', '.json'));
+      console.log(chalk.gray(`Agent session saved to ${logPath}`));
+    } catch (logError) {
+      console.log(chalk.yellow(`Warning: Could not save session log: ${logError.message}`));
+    }
     
-    // First, try to extract recent errors from terminal logs
-  let cmd = initialCmd;
-  console.log(chalk.gray('  Running command...\n'));
-  
-  // Run the command
-  echoCommand(cmd);
-  const { ok, output } = runCommand(cmd);
-  
-  if (ok && !/error/i.test(output)) {
-    console.log(boxen(chalk.green('No errors detected.'), { ...BOX.OUTPUT, title: 'Success' }));
-    return;
+  } catch (error) {
+    console.error(chalk.red(`Fatal error in agentic debug loop: ${error.message}`));
+    console.log(chalk.yellow('Falling back to user guidance...'));
   }
-    
-    // Extract possible file paths from the command or error logs
-      try {
-    // Extract possible filename from commands like "python file.py", "node script.js", etc.
-    let possibleFile = initialCmd;
-    
-    // Common command prefixes to check for
-    const commandPrefixes = ['python', 'python3', 'node', 'ruby', 'perl', 'php', 'java', 'javac', 'bash', 'sh'];
-    
-    // Check if the command starts with any of the common prefixes
-    for (const prefix of commandPrefixes) {
-      if (initialCmd.startsWith(prefix + ' ')) {
-        // Extract everything after the prefix and a space
-        possibleFile = initialCmd.substring(prefix.length + 1).trim();
-        break;
-      }
-    }
-    
-    // Further extract arguments if present (get first word that doesn't start with -)
-    possibleFile = possibleFile.split(' ').find(part => part && !part.startsWith('-')) || '';
-    
-    // First check relative path
-    filePath = possibleFile;
-    isValidSourceFile = filePath && fs.existsSync(filePath) && fs.statSync(filePath).isFile();
-    
-    // If not a file, try as absolute path
-    if (!isValidSourceFile && filePath && !filePath.startsWith('/')) {
-      filePath = join(currentDir.trim(), filePath);
-      isValidSourceFile = fs.existsSync(filePath) && fs.statSync(filePath).isFile();
-    }
-    
-    // Check if we need additional context from the file
-          // We'll read file content only if:
-      // 1. It's a valid file AND
-      // 2. There are NO clear error lines in the traceback
-      const filesWithErrors = extractFilesFromTraceback(output);
-      const hasErrorLineInfo = filesWithErrors.size > 0;
-      
-      if (isValidSourceFile && !hasErrorLineInfo) {
-        console.log(chalk.gray(`  Analyzing file content...`));
-        // Show the sed command that will be used
-        const start = 1; // Since we want first 200 lines, starting from line 1
-        const end = 200; // Read first 200 lines
-        const sedCmd = `sed -n '${start},${end}p' ${filePath}`;
-        echoCommand(sedCmd);
-        
-        // Use readFileContext to get the first 200 lines (using line 100 as center with ctx=100)
-        const fileContentInfo = readFileContext(filePath, 100, 100);
-        fileContentRaw = fileContentInfo.content;
-        
-        // Create a version with line numbers for analysis
-        fileContentWithLineNumbers = fileContentRaw.split('\n')
-          .map((line, index) => `${fileContentInfo.start + index}: ${line}`)
-          .join('\n');
-        
-        // Create file info object with content and line range
-        fileInfo = {
-          content: fileContentRaw,
-          withLineNumbers: fileContentWithLineNumbers,
-          start: fileContentInfo.start,
-          end: fileContentInfo.end,
-          path: filePath
-        };
-        
-        // Summarize code without displaying the prompt
-        
-        // Summarize the content - use the version with line numbers for better context
-        codeSummary = await summarizeCodeWithLLM(fileContentWithLineNumbers, currentModel);
-        // Display summary as indented gray text instead of boxen
-        console.log('\n' +'  ' + chalk.gray(codeSummary) + '\n');
-      }
-    } catch (error) {
-      console.log(chalk.yellow(`  Note: Could not analyze file content: ${error.message}`));
-    }
-  
-    // Display snippets from error traceback
-    if (!ok || /error/i.test(output)) {
-      displaySnippetsFromError(output);
-    }
-    
-    /* eslint-disable no-await-in-loop */
-    while (true) {
-      // First, run analysis like /analyze would do, but pass additional context
-      // Build the analysis prompt but don't display it
-      
-      const { analysis, reasoning: analysisReasoning, wasStreamed } = await analyzeWithLLM(
-        output, 
-        currentModel, 
-        fileInfo || { 
-          content: fileContentRaw, 
-          withLineNumbers: fileContentWithLineNumbers, 
-          start: 1, 
-          end: fileContentRaw.split('\n').length, 
-          path: filePath 
-        },
-        codeSummary, 
-        filePath,
-        'error_analysis',
-        userContext
-      );
-      
-      // Display reasoning if available
-      if (analysisReasoning) {
-        console.log(boxen(analysisReasoning, { ...BOX.OUTPUT_DARK, title: 'Reasoning' }));
-      }
-      
-      // Only display analysis if it wasn't already streamed
-      if (!wasStreamed) {
-        console.log('\n' +'  ' + chalk.gray(analysis.replace(/\n/g, '\n  ')) + '\n');
-      }
-      
-      // Determine if this is a terminal command issue using LLM
-      // Determine error type without displaying the prompt
-      
-      const errorType = await determineErrorType(output, analysis, currentModel, userContext);
-      // Display error type as indented gray text
-      console.log('  ' + chalk.gray(errorType) + '\n');
-      
-      if (errorType === "TERMINAL_COMMAND_ERROR") {
-        // Generate a new command to fix the issue
-        const prevCommands = iterations.map(i => i.patch).filter(Boolean);
-        
-        // Generate command fix without displaying the prompt
-        
-        const { command: newCommand, reasoning: cmdReasoning } = await generateTerminalCommandFix(prevCommands, analysis, currentModel, userContext);
-        
-        // Display command reasoning if available
-        if (cmdReasoning) {
-          console.log(boxen(cmdReasoning, { ...BOX.OUTPUT_DARK, title: 'Command Reasoning' }));
-        }
-        // Show the proposed command
-        console.log(boxen(newCommand, { ...BOX.OUTPUT, title: 'Proposed Command' }));
-        
-        // Ask for confirmation
-        if (!(await askYesNo('Run this command?'))) {
-          console.log(chalk.yellow('\nDebug loop aborted by user.'));
-          break;
-        }
-        
-        // Update the command for the next iteration
-        cmd = newCommand;
-        iterations.push({ error: output, patch: newCommand, analysis: analysis });
-      } else {
-        // Original code file patching logic
-        const prevPatches = iterations.map(i => i.patch);
-        
-        // Extract file paths and line numbers from the traceback
-        const filesWithErrors = extractFilesFromTraceback(output);
-        const errorFiles = Array.from(filesWithErrors.keys()).join('\n');
-        const errorLines = Array.from(filesWithErrors.values()).join('\n');
-        
-        // Get the exact lines of code where errors occur
-        const exactErrorCode = getErrorLines(output);
-        
-        // Get the code context with reduced context size (±3 lines)
-        const context = buildErrorContext(output, 3, false);
-        
-        // Generate patch without displaying the prompt
-        
-        const { diff: rawDiff, reasoning: patchReasoning } = await generatePatch(
-          output,
-          prevPatches,
-          analysis,
-          currentDir.trim(),
-          currentModel,
-          fileInfo || { 
-            content: fileContentRaw, 
-            withLineNumbers: fileContentWithLineNumbers, 
-            start: 1, 
-            end: fileContentRaw ? fileContentRaw.split('\n').length : 0, 
-            path: filePath 
-          },
-          codeSummary,
-          userContext
-        );
-        
-        // Display patch reasoning if available
-        if (patchReasoning) {
-          console.log(boxen(patchReasoning, { ...BOX.OUTPUT_DARK, title: 'Patch Reasoning' }));
-        }
-                
-        // Just extract the diff without displaying it
-        const cleanDiff = extractDiff(rawDiff);
-        
-        // Check if we have a valid diff
-        const isValidDiff = 
-          // Standard unified diff format
-          (cleanDiff.includes('---') && cleanDiff.includes('+++')) || 
-          // Path with @@ hunks and -/+ changes
-          (cleanDiff.includes('@@') && cleanDiff.includes('-') && cleanDiff.includes('+')) ||
-          // File path and -/+ lines without @@ marker (simpler format)
-          (cleanDiff.includes('/') && cleanDiff.includes('-') && cleanDiff.includes('+'));
-        
-        if (!isValidDiff) {
-          console.error(chalk.red('LLM did not return a valid diff. Aborting debug loop.'));
-          break;
-        }
-  
-        const applied = await confirmAndApply(cleanDiff, currentDir.trim());
-        
-        if (!applied) {
-          console.log(chalk.yellow('Debug loop aborted by user.'));
-          break;
-        }
-  
-        iterations.push({ error: output, patch: cleanDiff, analysis: analysis });
-        
-        // Write the debug log
-        await writeDebugLog(iterations, logPath);
-        console.log(chalk.gray(`Debug session saved to ${logPath}`));
-        
-        // Exit the loop after applying the patch instead of running the command again
-        console.log(chalk.green('Patch applied. Returning to main loop.'));
-        break;
-      }
-      
-      await writeDebugLog(iterations, logPath);
-      console.log(chalk.gray(`Debug session saved to ${logPath}`));
-    }
-  }
+}
   
 
 /* ───────────────────────────────  Main  ──────────────────────────────── */
@@ -634,6 +584,20 @@ function checkNetwork() {
     return true;
   } catch (error) {
     return false;
+  }
+}
+
+/**
+ * Gets progress status for user visualization
+ */
+function getProgressStatus(context) {
+  const solved = context.solved_issues?.length || 0;
+  const current = context.current_blocking_error?.type || "verification";
+  
+  if (solved === 0) {
+    return `Analyzing: ${current}`;
+  } else {
+    return `✓ Solved ${solved} issue(s) | Current: ${current}`;
   }
 }
 
