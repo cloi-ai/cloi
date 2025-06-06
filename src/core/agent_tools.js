@@ -35,22 +35,6 @@ import {
  */
 export const AVAILABLE_TOOLS = [
   {
-    name: "initial_error_analyzer",
-    description: "Parses and analyzes the initial command's error output (stderr), traceback, and stdout. Identifies key error messages, relevant file paths, and line numbers. This should typically be the first diagnostic step if an error occurred.",
-    parameters: {
-      command_details: {
-        type: "object",
-        properties: {
-          command_string: { type: "string" },
-          stdout: { type: "string" },
-          stderr: { type: "string" },
-          exit_code: { type: "number" }
-        },
-        required: ["command_string", "stderr", "exit_code"]
-      }
-    }
-  },
-  {
     name: "list_directory_contents",
     description: "Lists all files and subdirectories within a specified directory. If no path is given, lists contents of the current_working_directory.",
     parameters: {
@@ -210,189 +194,226 @@ function createFileMappings(tracebackFiles, discoveredFiles) {
 }
 
 /**
- * Tool implementation functions
+ * Knowledge base update functions
  */
 
-export async function initial_error_analyzer(params, context) {
-  try {
-    // DEBUG: Log what parameters are being passed
-    console.log(chalk.blue('🔍 DEBUG: initial_error_analyzer called with:'));
-    console.log(chalk.gray('  - params:', JSON.stringify(params, null, 2)));
+/**
+ * Updates the knowledge base with newly discovered files and directories
+ */
+function updateKnowledgeBaseWithNewFiles(context, directoryPath, newContents) {
+  if (!context.knowledge_base) return;
+  
+  const relativeDirPath = relative(context.current_working_directory || '.', directoryPath);
+  console.log(chalk.blue(`🔄 Updating knowledge base with discoveries from: ${relativeDirPath || '.'}`));
+  
+  let updatesCount = 0;
+  
+  // 1. Update file_structure.flat_files with new files
+  if (context.knowledge_base.file_structure) {
+    const existingPaths = new Set(context.knowledge_base.file_structure.flat_files.map(f => f.path));
+    const newFiles = newContents.filter(item => 
+      item.type === 'file' && 
+      !existingPaths.has(item.path) &&
+      shouldIncludeFileInKnowledgeBase(item)
+    );
     
-    const { command_details } = params;
-    if (!command_details) {
-      return {
-        status: "error",
-        message: "Missing command_details parameter"
-      };
+    if (newFiles.length > 0) {
+      context.knowledge_base.file_structure.flat_files.push(...newFiles);
+      context.knowledge_base.file_structure.metadata.relevant_files += newFiles.length;
+      context.knowledge_base.file_structure.metadata.code_files += newFiles.filter(f => f.is_code_file).length;
+      updatesCount += newFiles.length;
+      
+      console.log(chalk.green(`  ✓ Added ${newFiles.length} new files to flat_files`));
     }
+  }
+  
+  // 2. Update file_state.discovered_files with relevant new files
+  if (context.file_state) {
+    const existingFiles = new Set(context.file_state.discovered_files);
+    const newRelevantFiles = newContents
+      .filter(item => item.type === 'file' && !existingFiles.has(item.name) && shouldIncludeFileInKnowledgeBase(item))
+      .map(item => item.name);
     
-    const { command_string, stdout, stderr, exit_code } = command_details;
-    
-    // Ensure stdout and stderr are strings to prevent undefined errors
-    const safeStdout = stdout || '';
-    const safeStderr = stderr || '';
-    const safeCommand = command_string || 'unknown';
-    const safeExitCode = exit_code !== undefined ? exit_code : 1;
-    
-    // NEW: Check if this is error evolution, not initial analysis
-    const isEvolution = context.session_history.length > 1;
-    const isFirstStep = context.session_history.length === 0;
-    
-    if (isEvolution && !isFirstStep) {
-      // Focus on error progression, not full re-analysis
-      const analysis = await analyzeErrorEvolution(command_details, context);
-      return {
-        status: "success",
-        analysis_type: "error_evolution",
-        ...analysis
-      };
+    if (newRelevantFiles.length > 0) {
+      context.file_state.discovered_files.push(...newRelevantFiles);
+      console.log(chalk.green(`  ✓ Added ${newRelevantFiles.length} files to file_state cache`));
     }
+  }
+  
+  // 3. Update tree_structure if we're exploring a new directory
+  if (context.knowledge_base.file_structure && context.knowledge_base.file_structure.tree_structure) {
+    updateTreeStructureWithDirectory(context.knowledge_base.file_structure.tree_structure, relativeDirPath, newContents);
+  }
+  
+  // 4. Log exploration note
+  if (updatesCount > 0) {
+    context.knowledge_base.error_analysis_notes = context.knowledge_base.error_analysis_notes || [];
+    context.knowledge_base.error_analysis_notes.push({
+      type: 'directory_exploration',
+      directory: relativeDirPath || 'root',
+      files_discovered: newContents.filter(c => c.type === 'file').length,
+      directories_discovered: newContents.filter(c => c.type === 'directory').length,
+      timestamp: new Date().toISOString()
+    });
     
-    // DEBUG: Log raw command output being processed
-    console.log(chalk.blue('🔍 DEBUG: Command details:'));
-    console.log(chalk.gray(`  - Command: ${safeCommand}`));
-    console.log(chalk.gray(`  - Exit code: ${safeExitCode}`));
-    console.log(chalk.gray(`  - Stdout length: ${safeStdout.length}`));
-    console.log(chalk.gray(`  - Stderr length: ${safeStderr.length}`));
-    console.log(chalk.gray('--- START STDERR ---'));
-    console.log(safeStderr);
-    console.log(chalk.gray('--- END STDERR ---'));
-    console.log(chalk.gray('--- START STDOUT ---'));
-    console.log(safeStdout);
-    console.log(chalk.gray('--- END STDOUT ---'));
-    
-    // Use existing traceback utilities for initial analysis
-    // Check both stderr and stdout for traceback information
-    const combinedOutput = safeStderr + '\n' + safeStdout;
-    const filesWithErrors = extractFilesFromTraceback(combinedOutput);
-    const errorLines = getErrorLines(combinedOutput);
-    const errorContext = buildErrorContext(combinedOutput, 5);
-    
-    // DEBUG: Log detected files to console for visibility
-    console.log(chalk.blue('🔍 DEBUG: Files detected from traceback:'));
-    for (const [file, line] of filesWithErrors.entries()) {
-      console.log(chalk.gray(`  - ${file} (line ${line})`));
-    }
-    // Filter files to only include those that exist and are accessible
-    const workingDir = context.current_working_directory || '.';
-    const existingFiles = [];
-    for (const [fullPath, line] of filesWithErrors.entries()) {
-      const fileName = fullPath.split('/').pop();
-      const resolvedPath = resolve(workingDir, fileName);
-      if (fs.existsSync(resolvedPath)) {
-        existingFiles.push(fileName);
-        console.log(chalk.green(`  ✓ Found: ${fileName} -> ${resolvedPath}`));
-      } else {
-        console.log(chalk.yellow(`  ✗ Missing: ${fileName} (from ${fullPath})`));
-      }
-    }
-    
-    console.log(chalk.blue(`🔍 DEBUG: Files to read: ${existingFiles.join(', ')}`));
-    console.log(chalk.blue(`🔍 DEBUG: Working directory: ${context.current_working_directory}`));
-    
-    // Create file mappings from traceback to discovered files
-    const fileMappings = createFileMappings(filesWithErrors, existingFiles);
-    
-    // If no files were found in traceback, do directory discovery
-    if (existingFiles.length === 0) {
-      console.log(chalk.yellow('🔍 No files found in traceback - performing directory discovery...'));
-      try {
-        const entries = await fsPromises.readdir(workingDir, { withFileTypes: true });
-        const codeFiles = entries
-          .filter(entry => entry.isFile())
-          .map(entry => entry.name)
-          .filter(name => {
-            const ext = name.split('.').pop()?.toLowerCase();
-            return ['py', 'js', 'ts', 'jsx', 'tsx', 'java', 'cpp', 'c', 'rb', 'go', 'rs'].includes(ext);
-          });
-        
-        console.log(chalk.green(`🔍 Found code files in directory: ${codeFiles.join(', ')}`));
-        
-        // Add discovered files to existingFiles for analysis
-        existingFiles.push(...codeFiles);
-      } catch (dirError) {
-        console.log(chalk.red(`🔍 Failed to list directory: ${dirError.message}`));
-      }
-    }
-    
-    // Analyze the error output
-    const analysis = {
-      command_executed: safeCommand,
-      exit_code: safeExitCode,
-      error_type: safeExitCode !== 0 ? 'execution_error' : 'warning',
-      files_mentioned: Array.from(filesWithErrors.keys()),
-      files_to_read: existingFiles, // Only files that actually exist
-      error_lines: errorLines,
-      key_error_messages: extractKeyErrorMessages(combinedOutput),
-      traceback_summary: combinedOutput.split('\n').filter(line => 
-        line.includes('Error:') || 
-        line.includes('Exception:') || 
-        line.includes('Traceback')
-      ),
-      suggested_focus_areas: suggestFocusAreas(combinedOutput, filesWithErrors),
-      immediate_next_action: getImmediateNextAction(combinedOutput, existingFiles, workingDir)
-    };
-    
-    return {
-      status: "success",
-      analysis_type: "initial_analysis",
-      analysis,
-      files_with_errors: Array.from(filesWithErrors.keys()),
-      error_context: errorContext,
-      // NEW: Add file state for persistence
-      file_state: {
-        discovered_files: existingFiles,
-        primary_error_file: existingFiles.find(f => f.endsWith('.py')) || existingFiles[0],
-        file_mappings: fileMappings,
-        working_directory: context.current_working_directory
-      }
-    };
-  } catch (error) {
-    return {
-      status: "error",
-      message: `Failed to analyze error: ${error.message}`
-    };
+    console.log(chalk.blue(`  📊 Total knowledge base updates: ${updatesCount}`));
   }
 }
 
 /**
- * Analyzes error evolution instead of doing full re-analysis
+ * Determines if a file should be included in the knowledge base based on our filtering criteria
  */
-async function analyzeErrorEvolution(commandDetails, context) {
-  const { stderr, stdout } = commandDetails;
-  const safeStderr = stderr || '';
-  const safeStdout = stdout || '';
-  const previousError = context.solved_issues.length > 0 ? 
-    context.solved_issues[context.solved_issues.length - 1] : null;
-  
-  // Import error parsing function
-  const { parseErrorFromOutput } = await import('./agent_prompt.js');
-  const currentError = parseErrorFromOutput(safeStderr);
-  
-  const progressAssessment = previousError ? 
-    `✓ Previous error resolved: ${previousError.type}\n⚠ New issue detected: ${currentError?.type || 'Unknown'}` :
-    `Continuing analysis of: ${currentError?.type || 'Unknown error'}`;
-  
-  return {
-    previous_error_resolved: !!previousError,
-    new_error_detected: currentError,
-    progress_assessment: progressAssessment,
-    recommended_focus: currentError?.type || "verification",
-    stdout_preview: safeStdout ? safeStdout.substring(0, 500) + (safeStdout.length > 500 ? '...' : '') : '',
-    error_evolution_summary: `Step-by-step progress: ${context.solved_issues.length} issues resolved, ${currentError ? '1 active issue' : 'no current issues'}`
-  };
+function shouldIncludeFileInKnowledgeBase(fileItem) {
+  return fileItem.is_code_file ||                                                    // All code files
+         (fileItem.name === 'package.json' && !fileItem.path.includes('node_modules/')) || // Only root package.json
+         (fileItem.name === 'package-lock.json') ||                                 // Package lock files
+         ['yaml', 'yml', 'env', 'toml', 'ini', 'cfg', 'conf'].includes(fileItem.extension) || // Config files
+         (fileItem.extension === 'md' && fileItem.depth <= 1) ||                   // Only root-level docs
+         fileItem.name.toLowerCase().includes('requirements') ||                    // Python requirements
+         fileItem.name.toLowerCase().includes('dockerfile') ||                      // Docker files
+         fileItem.name.toLowerCase().includes('makefile') ||                        // Build files
+         (fileItem.name.startsWith('.') && fileItem.size_bytes < 5000) ||          // Small dotfiles only
+         (fileItem.size_bytes < 1000 && fileItem.depth <= 1);                      // Very small root files only
 }
+
+/**
+ * Validates if cached search results are still valid based on file modification times
+ */
+async function isSearchCacheValid(cachedSearch, context) {
+  try {
+    // Cache is valid for 5 minutes regardless of file changes (performance optimization)
+    const cacheAgeMs = Date.now() - cachedSearch.timestamp;
+    const maxCacheAgeMs = 5 * 60 * 1000; // 5 minutes
+    
+    if (cacheAgeMs < maxCacheAgeMs) {
+      // For recent caches, do a quick validation of a few key files
+      const filesToCheck = cachedSearch.searched_files_metadata.slice(0, Math.min(5, cachedSearch.searched_files_metadata.length));
+      
+      for (const fileMetadata of filesToCheck) {
+        try {
+          const { promises: fsPromises } = await import('fs');
+          const { resolve } = await import('path');
+          const fullPath = resolve(context.current_working_directory || '.', fileMetadata.path);
+          const stats = await fsPromises.stat(fullPath);
+          
+          // If any checked file has changed, invalidate cache
+          if (stats.mtime.getTime() !== fileMetadata.mtime) {
+            console.log(chalk.yellow(`  ⚠️ Cache invalidated: ${fileMetadata.path} modified`));
+            return false;
+          }
+        } catch (statError) {
+          // If file no longer exists, invalidate cache
+          console.log(chalk.yellow(`  ⚠️ Cache invalidated: ${fileMetadata.path} not accessible`));
+          return false;
+        }
+      }
+      
+      return true; // Cache is valid
+    }
+    
+    // For older caches, always invalidate to ensure freshness
+    console.log(chalk.yellow(`  ⚠️ Cache expired: ${Math.round(cacheAgeMs / 1000)}s old (max: ${Math.round(maxCacheAgeMs / 1000)}s)`));
+    return false;
+    
+  } catch (error) {
+    // If validation fails, assume cache is invalid
+    console.log(chalk.yellow(`  ⚠️ Cache validation failed: ${error.message}`));
+    return false;
+  }
+}
+
+/**
+ * Generates visual tree representation from cached tree structure
+ */
+function generateVisualTreeFromStructure(treeStructure, maxDepth, includeHidden, currentDepth = 0, prefix = '') {
+  const lines = [];
+  
+  if (currentDepth >= maxDepth) return lines;
+  
+  const entries = Object.entries(treeStructure).filter(([name, node]) => 
+    includeHidden || !name.startsWith('.')
+  );
+  
+  entries.forEach(([name, node], index) => {
+    const isLast = index === entries.length - 1;
+    const currentPrefix = prefix + (isLast ? '└── ' : '├── ');
+    const nextPrefix = prefix + (isLast ? '    ' : '│   ');
+    
+    if (node.type === 'directory') {
+      lines.push(`${currentPrefix}${name}/`);
+      if (node.children && currentDepth + 1 < maxDepth) {
+        lines.push(...generateVisualTreeFromStructure(
+          node.children, maxDepth, includeHidden, currentDepth + 1, nextPrefix
+        ));
+      }
+    } else {
+      const sizeInfo = node.size_formatted ? ` (${node.size_formatted})` : '';
+      lines.push(`${currentPrefix}${name}${sizeInfo}`);
+    }
+  });
+  
+  return lines;
+}
+
+/**
+ * Updates the tree structure with a new directory's contents
+ */
+function updateTreeStructureWithDirectory(treeStructure, relativeDirPath, contents) {
+  const pathParts = relativeDirPath ? relativeDirPath.split('/').filter(Boolean) : [];
+  let currentNode = treeStructure;
+  
+  // Navigate to the correct node in the tree
+  for (const part of pathParts) {
+    if (!currentNode[part]) {
+      currentNode[part] = {
+        type: "directory",
+        path: pathParts.slice(0, pathParts.indexOf(part) + 1).join('/'),
+        depth: pathParts.indexOf(part),
+        children: {}
+      };
+    }
+    currentNode = currentNode[part].children;
+  }
+  
+  // Add new contents to this node
+  for (const item of contents) {
+    if (!currentNode[item.name]) {
+      if (item.type === 'directory') {
+        currentNode[item.name] = {
+          type: "directory",
+          path: item.path,
+          depth: item.depth,
+          children: {}
+        };
+      } else {
+        currentNode[item.name] = {
+          type: "file",
+          path: item.path,
+          depth: item.depth,
+          size_bytes: item.size_bytes,
+          size_formatted: item.size_formatted,
+          extension: item.extension
+        };
+      }
+    }
+  }
+}
+
+/**
+ * Tool implementation functions
+ */
+
 
 export async function list_directory_contents(params, context) {
   try {
     const directory_path = params.directory_path || '.';
     
-    // NEW: Use cached file state if available for current directory
-    if (!params.directory_path && context.file_state && context.file_state.discovered_files) {
-      console.log(chalk.blue('🔍 Using cached file discovery instead of re-listing directory'));
-      console.log(chalk.green(`  ✓ Found ${context.file_state.discovered_files.length} cached files: ${context.file_state.discovered_files.join(', ')}`));
-      console.log(chalk.gray('  ⚠ Note: Cache only includes root-level code files, not subdirectories'));
+    // Check if we can use cached data for the current directory
+    const requestingRootDir = !params.directory_path || directory_path === '.';
+    if (requestingRootDir && context.file_state && context.file_state.discovered_files) {
+      console.log(`  ${chalk.blueBright.bold('$')} ${chalk.blueBright.bold('ls -la')} ${chalk.gray('(using cache)')}`);
+      console.log(chalk.green(`  ✓ Found ${context.file_state.discovered_files.length} cached files`));
+      console.log(chalk.gray('  💡 Use a specific directory_path to explore subdirectories'));
       
       return {
         status: "success",
@@ -400,36 +421,68 @@ export async function list_directory_contents(params, context) {
         contents: context.file_state.discovered_files,
         detailed_contents: context.file_state.discovered_files.map(name => ({
           name,
-          type: 'file',
+          type: 'file', // Cache only contains files
           isHidden: name.startsWith('.')
         })),
         source: "cached_from_file_state",
-        limitation: "root_level_only"
+        cache_note: "Root directory cache - use directory_path to explore subdirectories"
       };
     }
     
     // Resolve directory path relative to the user's working directory, not the CLI's directory
     const resolvedPath = resolve(context.current_working_directory || '.', directory_path);
     
-    // DEBUG: Log directory path resolution
-    console.log(chalk.blue('🔍 DEBUG: Directory listing:'));
-    console.log(chalk.gray(`  - Requested directory: ${directory_path}`));
-    console.log(chalk.gray(`  - Working directory: ${context.current_working_directory}`));
-    console.log(chalk.gray(`  - Resolved path: ${resolvedPath}`));
-    console.log(chalk.gray(`  - Directory exists: ${fs.existsSync(resolvedPath)}`));
+    // Show CLI command being executed (with -la for detailed listing)
+    const displayPath = directory_path === '.' ? '' : ` ${directory_path}`;
+    console.log(`  ${chalk.blueBright.bold('$')} ${chalk.blueBright.bold(`ls -la${displayPath}`)}`);
+    
+    // Show path being explored
+    console.log(chalk.gray(`  → Exploring: ${resolvedPath}`));
     
     const entries = await fsPromises.readdir(resolvedPath, { withFileTypes: true });
-    const contents = entries.map(entry => ({
-      name: entry.name,
-      type: entry.isDirectory() ? 'directory' : 'file',
-      isHidden: entry.name.startsWith('.')
+    const contents = await Promise.all(entries.map(async entry => {
+      const fullPath = join(resolvedPath, entry.name);
+      const relativePath = relative(context.current_working_directory || '.', fullPath);
+      
+      let size_bytes = 0;
+      let size_formatted = "unknown";
+      
+      if (entry.isFile()) {
+        try {
+          const stats = await fsPromises.stat(fullPath);
+          size_bytes = stats.size;
+          size_formatted = size_bytes < 1024 ? `${size_bytes}B` : 
+                          size_bytes < 1024 * 1024 ? `${Math.round(size_bytes / 1024)}KB` :
+                          `${Math.round(size_bytes / (1024 * 1024))}MB`;
+        } catch (statError) {
+          // Keep defaults
+        }
+      }
+      
+      return {
+        name: entry.name,
+        type: entry.isDirectory() ? 'directory' : 'file',
+        isHidden: entry.name.startsWith('.'),
+        path: relativePath,
+        size_bytes,
+        size_formatted,
+        extension: entry.isFile() ? (entry.name.split('.').pop()?.toLowerCase() || null) : null,
+        is_code_file: entry.isFile() && ['py', 'js', 'ts', 'jsx', 'tsx', 'java', 'cpp', 'c', 'rb', 'go', 'rs', 'php', 'swift', 'kt', 'cs'].includes(entry.name.split('.').pop()?.toLowerCase()),
+        depth: relativePath.split('/').length - 1
+      };
     }));
+    
+    // Update knowledge base with new discoveries
+    updateKnowledgeBaseWithNewFiles(context, resolvedPath, contents);
     
     return {
       status: "success",
       directory_path: resolvedPath,
       contents: contents.map(c => `${c.name}${c.type === 'directory' ? '/' : ''}`),
-      detailed_contents: contents
+      detailed_contents: contents,
+      knowledge_base_updated: true,
+      new_files_discovered: contents.filter(c => c.type === 'file').length,
+      new_directories_discovered: contents.filter(c => c.type === 'directory').length
     };
   } catch (error) {
     return {
@@ -547,6 +600,9 @@ export async function run_diagnostic_command(params, context) {
         message: `Command '${command_string}' appears to be potentially destructive and is not allowed`
       };
     }
+    
+    // Show CLI command being executed
+    console.log(`  ${chalk.blueBright.bold('$')} ${chalk.blueBright.bold(command_string)}`);
     
     const result = runCommand(command_string);
     
@@ -723,8 +779,41 @@ export async function search_file_content(params, context) {
   try {
     const { search_pattern, file_extensions = ['.js', '.py', '.ts', '.jsx', '.tsx', '.json'], max_results = 10 } = params;
     
+    // Generate cache key
+    const cacheKey = `${search_pattern}:${file_extensions.sort().join(',')}:${max_results}`;
+    
+    // Check if we can use cached search results
+    const cachedSearch = context.knowledge_base?.search_results?.[cacheKey];
+    if (cachedSearch && await isSearchCacheValid(cachedSearch, context)) {
+      // Show CLI command with cache indicator
+      const extensionPattern = file_extensions.length > 1 ? `{${file_extensions.join(',')}}` : file_extensions[0] || '*';
+      console.log(`  ${chalk.blueBright.bold('$')} ${chalk.blueBright.bold(`grep -r "${search_pattern}" --include="*${extensionPattern}"`)} ${chalk.gray('(using cache)')}`);
+      console.log(chalk.green(`  ✓ Found ${cachedSearch.results.length} cached results from ${cachedSearch.files_searched} files`));
+      console.log(chalk.gray(`  💡 Cache created: ${new Date(cachedSearch.timestamp).toLocaleTimeString()}`));
+      
+      return {
+        status: "success",
+        search_pattern: cachedSearch.search_pattern,
+        results_count: cachedSearch.results.length,
+        results: cachedSearch.results.slice(0, max_results),
+        source: "cached_search_results",
+        cache_info: {
+          cached_at: cachedSearch.timestamp,
+          files_searched: cachedSearch.files_searched,
+          original_max_results: cachedSearch.max_results
+        }
+      };
+    }
+    
+    // Show CLI command for fresh search
+    const extensionPattern = file_extensions.length > 1 ? `{${file_extensions.join(',')}}` : file_extensions[0] || '*';
+    console.log(`  ${chalk.blueBright.bold('$')} ${chalk.blueBright.bold(`grep -r "${search_pattern}" --include="*${extensionPattern}"`)}`);
+    console.log(chalk.gray(`  → Performing fresh content search`));
+    
     // Use a simple recursive search
     const results = [];
+    const searchedFiles = [];
+    const currentTime = Date.now();
     
     async function searchInDirectory(dir, depth = 0) {
       if (depth > 3 || results.length >= max_results) return;
@@ -742,7 +831,16 @@ export async function search_file_content(params, context) {
           } else if (entry.isFile()) {
             const hasValidExtension = file_extensions.some(ext => entry.name.endsWith(ext));
             if (hasValidExtension) {
+              const relativePath = relative(context.current_working_directory || '.', fullPath);
               try {
+                // Track file metadata for cache invalidation
+                const stats = await fsPromises.stat(fullPath);
+                searchedFiles.push({
+                  path: relativePath,
+                  mtime: stats.mtime.getTime(),
+                  size: stats.size
+                });
+                
                 const content = await fsPromises.readFile(fullPath, 'utf8');
                 const lines = content.split('\n');
                 
@@ -750,7 +848,7 @@ export async function search_file_content(params, context) {
                   if (results.length >= max_results) return;
                   if (line.toLowerCase().includes(search_pattern.toLowerCase())) {
                     results.push({
-                      file: relative(context.current_working_directory || '.', fullPath),
+                      file: relativePath,
                       line_number: index + 1,
                       line_content: line.trim(),
                       context: lines.slice(Math.max(0, index - 1), index + 2)
@@ -770,11 +868,46 @@ export async function search_file_content(params, context) {
     
     await searchInDirectory(context.current_working_directory || '.');
     
+    // Cache the search results for future use
+    const searchResult = {
+      search_pattern,
+      file_extensions,
+      max_results,
+      results: results.slice(0, max_results),
+      files_searched: searchedFiles.length,
+      searched_files_metadata: searchedFiles,
+      timestamp: currentTime
+    };
+    
+    // Update knowledge base with search cache
+    if (context.knowledge_base) {
+      context.knowledge_base.search_results = context.knowledge_base.search_results || {};
+      context.knowledge_base.search_results[cacheKey] = searchResult;
+      
+      // Update file metadata for cache invalidation
+      context.knowledge_base.file_metadata = context.knowledge_base.file_metadata || {};
+      searchedFiles.forEach(file => {
+        context.knowledge_base.file_metadata[file.path] = {
+          mtime: file.mtime,
+          size: file.size,
+          last_checked: currentTime
+        };
+      });
+      
+      console.log(chalk.blue(`🔄 Cached search results (${results.length} matches from ${searchedFiles.length} files)`));
+    }
+    
     return {
       status: "success",
       search_pattern,
       results_count: results.length,
-      results: results.slice(0, max_results)
+      results: results.slice(0, max_results),
+      source: "fresh_content_search",
+      search_info: {
+        files_searched: searchedFiles.length,
+        cache_updated: true,
+        search_duration_ms: Date.now() - currentTime
+      }
     };
   } catch (error) {
     return {
@@ -787,6 +920,38 @@ export async function search_file_content(params, context) {
 export async function get_file_structure(params, context) {
   try {
     const { max_depth = 3, include_hidden = false } = params;
+    
+    // Check if we can use cached file structure
+    const cachedStructure = context.knowledge_base?.file_structure;
+    if (cachedStructure && 
+        cachedStructure.max_depth >= max_depth && 
+        (!include_hidden || cachedStructure.included_hidden)) {
+      
+      console.log(`  ${chalk.blueBright.bold('$')} ${chalk.blueBright.bold(`tree -L ${max_depth}${include_hidden ? ' -a' : ''}`)} ${chalk.gray('(using cache)')}`);
+      
+      // Generate visual tree from cached tree_structure
+      const visualTree = generateVisualTreeFromStructure(cachedStructure.tree_structure, max_depth, include_hidden);
+      
+      console.log(chalk.green(`  ✓ Using cached structure (${cachedStructure.metadata.total_files} files)`));
+      console.log(chalk.gray('  💡 Structure was pre-built during initialization'));
+      
+      return {
+        status: "success",
+        structure: visualTree,
+        structure_text: visualTree.join('\n'),
+        source: "cached_from_knowledge_base",
+        cache_info: {
+          cached_max_depth: cachedStructure.max_depth,
+          total_files: cachedStructure.metadata.total_files,
+          relevant_files: cachedStructure.metadata.relevant_files
+        }
+      };
+    }
+    
+    // Show CLI command being executed (fresh scan)
+    const hiddenFlag = include_hidden ? 'a' : '';
+    console.log(`  ${chalk.blueBright.bold('$')} ${chalk.blueBright.bold(`tree -L ${max_depth}${hiddenFlag ? ' -a' : ''}`)}`);
+    console.log(chalk.gray(`  → Performing fresh filesystem scan`));
     
     const structure = [];
     
@@ -829,10 +994,35 @@ export async function get_file_structure(params, context) {
     
     await buildStructure(context.current_working_directory || '.');
     
+    // Update knowledge base if this scan was deeper or more comprehensive than cached version
+    if (context.knowledge_base && 
+        (!cachedStructure || max_depth > cachedStructure.max_depth || 
+         (include_hidden && !cachedStructure.included_hidden))) {
+      
+      console.log(chalk.blue(`🔄 Updating knowledge base with enhanced file structure (depth: ${max_depth}, hidden: ${include_hidden})`));
+      
+      // Note: For now, we'll just log the update. In a full implementation, we'd 
+      // rebuild the tree_structure and flat_files from the fresh scan
+      context.knowledge_base.error_analysis_notes = context.knowledge_base.error_analysis_notes || [];
+      context.knowledge_base.error_analysis_notes.push({
+        type: 'file_structure_update',
+        scan_depth: max_depth,
+        include_hidden: include_hidden,
+        lines_generated: structure.length,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
     return {
       status: "success",
       structure: structure,
-      structure_text: structure.join('\n')
+      structure_text: structure.join('\n'),
+      source: "fresh_filesystem_scan",
+      scan_info: {
+        max_depth: max_depth,
+        include_hidden: include_hidden,
+        total_items: structure.length
+      }
     };
   } catch (error) {
     return {
@@ -876,7 +1066,6 @@ export async function executeAgentTool(toolName, parameters, context) {
   }
   
   const toolFunctions = {
-    initial_error_analyzer,
     list_directory_contents,
     read_file_content,
     run_diagnostic_command,

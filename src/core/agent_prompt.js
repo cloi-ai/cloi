@@ -21,19 +21,19 @@ CORE PRINCIPLES:
 - The user must confirm destructive actions (handled by propose_* tools)
 
 CRITICAL SUCCESS PRIORITIES:
-1. MANDATORY FIRST STEP: ALWAYS start with initial_error_analyzer - NO EXCEPTIONS for step 1
+1. IMMEDIATE ANALYSIS: The system has already analyzed the error and populated directory info
 2. THOROUGH ANALYSIS: Understand the error completely before proposing solutions
 3. MINIMAL TOOL USAGE: Only call tools when you need additional information to make the right fix
 4. CORRECT FIXES: Every patch must result in code that executes successfully
 5. AVOID RECKLESS SUGGESTIONS: Never guess at fixes without sufficient information
 
 DECISION-MAKING STRATEGY (BALANCED APPROACH):
-1. STEP 1: ALWAYS use initial_error_analyzer to understand the full error context
-2. ANALYZE THOROUGHLY: After error analysis, think through the problem carefully
+1. STEP 1: Review the pre-populated knowledge base for error context and available files
+2. ANALYZE THOROUGHLY: Think through the problem using the provided error context
 3. CALL TOOLS ONLY WHEN NEEDED: 
    - Read files only if you need to see the actual code to understand the fix
    - Use diagnostic commands only if you need environment/system information
-   - List directories only if you need to understand project structure
+   - List directories only if you need more detailed structure info
 4. PROPOSE FIXES: Once you have sufficient information, propose the correct solution
 5. VERIFY LOGIC: Before proposing, mentally verify your fix will work
 
@@ -79,14 +79,282 @@ TOOL PARAMETER EXAMPLES:
 - run_diagnostic_command: {"command_string": "pip list"}
 - read_file_content: {"file_path": "main.py"}
 - list_directory_contents: {"directory_path": "."}
-- initial_error_analyzer: Use the exact command_details from initial_command_run in the context
 
 CRITICAL: Always provide the required parameters for each tool!`;
 
 /**
- * Creates initial agent context from user request and command details
+ * Helper function to get file structure data in LLM-friendly format
  */
-export function createInitialAgentContext(userRequest, commandDetails, currentDirectory) {
+async function getFileStructureData(currentDirectory, maxDepth = 3, includeHidden = false) {
+  const { promises: fsPromises } = await import('fs');
+  const { join, relative } = await import('path');
+  
+  const treeStructure = {};
+  const flatFiles = [];
+  
+  async function buildStructure(dir, depth = 0, currentNode = treeStructure) {
+    if (depth >= maxDepth) return;
+    
+    try {
+      const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+      const filteredEntries = entries.filter(entry => 
+        includeHidden || !entry.name.startsWith('.')
+      );
+      
+      for (let i = 0; i < filteredEntries.length; i++) {
+        const entry = filteredEntries[i];
+        
+        const fullPath = join(dir, entry.name);
+        const relativePath = relative(currentDirectory, fullPath);
+        
+        if (entry.isDirectory()) {
+          // Add to tree structure
+          currentNode[entry.name] = {
+            type: "directory",
+            path: relativePath,
+            depth: depth,
+            children: {}
+          };
+          
+          // Recurse into directory
+          await buildStructure(fullPath, depth + 1, currentNode[entry.name].children);
+        } else {
+          try {
+            const stats = await fsPromises.stat(fullPath);
+            const sizeBytes = stats.size;
+            const sizeFormatted = sizeBytes < 1024 ? `${sizeBytes}B` : 
+                                sizeBytes < 1024 * 1024 ? `${Math.round(sizeBytes / 1024)}KB` :
+                                `${Math.round(sizeBytes / (1024 * 1024))}MB`;
+            
+            // Add to tree structure
+            currentNode[entry.name] = {
+              type: "file",
+              path: relativePath,
+              depth: depth,
+              size_bytes: sizeBytes,
+              size_formatted: sizeFormatted,
+              extension: entry.name.split('.').pop()?.toLowerCase() || null
+            };
+            
+            // Add to flat files list
+            flatFiles.push({
+              name: entry.name,
+              path: relativePath,
+              type: "file",
+              depth: depth,
+              size_bytes: sizeBytes,
+              size_formatted: sizeFormatted,
+              extension: entry.name.split('.').pop()?.toLowerCase() || null,
+              is_code_file: ['py', 'js', 'ts', 'jsx', 'tsx', 'java', 'cpp', 'c', 'rb', 'go', 'rs', 'php', 'swift', 'kt', 'cs'].includes(entry.name.split('.').pop()?.toLowerCase())
+            });
+          } catch (statError) {
+            currentNode[entry.name] = {
+              type: "file",
+              path: relativePath,
+              depth: depth,
+              size_bytes: 0,
+              size_formatted: "unknown",
+              extension: entry.name.split('.').pop()?.toLowerCase() || null
+            };
+          }
+        }
+      }
+    } catch (dirError) {
+      // Skip directories that can't be read
+    }
+  }
+  
+  await buildStructure(currentDirectory);
+  
+  // Filter flat_files to only include debugging-relevant files (aggressive filtering)
+  const relevantFiles = flatFiles.filter(f => 
+    f.is_code_file ||                                                    // All code files
+    (f.name === 'package.json' && !f.path.includes('node_modules/')) || // Only root package.json
+    (f.name === 'package-lock.json') ||                                 // Package lock files
+    ['yaml', 'yml', 'env', 'toml', 'ini', 'cfg', 'conf'].includes(f.extension) || // Config files (not json - too many)
+    (f.extension === 'md' && f.depth <= 1) ||                           // Only root-level docs
+    f.name.toLowerCase().includes('requirements') ||                    // Python requirements
+    f.name.toLowerCase().includes('dockerfile') ||                      // Docker files
+    f.name.toLowerCase().includes('makefile') ||                        // Build files
+    (f.name.startsWith('.') && f.size_bytes < 5000) ||                 // Small dotfiles only
+    (f.size_bytes < 1000 && f.depth <= 1)                              // Very small root files only
+  );
+  
+  return {
+    status: "success",
+    tree_structure: treeStructure,
+    flat_files: relevantFiles,
+    metadata: {
+      total_files: flatFiles.length,
+      relevant_files: relevantFiles.length,
+      filtered_out: flatFiles.length - relevantFiles.length,
+      code_files: relevantFiles.filter(f => f.is_code_file).length,
+      relevant_extensions: [...new Set(relevantFiles.map(f => f.extension).filter(Boolean))].slice(0, 8),
+      project_root: currentDirectory
+    }
+  };
+}
+
+function countDirectories(node) {
+  let count = 0;
+  for (const [key, value] of Object.entries(node)) {
+    if (value.type === 'directory') {
+      count += 1 + countDirectories(value.children);
+    }
+  }
+  return count;
+}
+
+/**
+ * Pre-populates knowledge base with directory information and error analysis
+ */
+async function initializeKnowledgeBase(commandDetails, currentDirectory) {
+  const knowledgeBase = {
+    files_read: {},
+    error_analysis_notes: [],
+    file_structure: null,
+    error_context: null,
+    search_results: {},         // Cache for search_file_content results
+    file_metadata: {}           // File modification times for cache invalidation
+  };
+
+  try {
+    // Import necessary utilities
+    const { promises: fsPromises } = await import('fs');
+    const { resolve } = await import('path');
+    const { 
+      buildErrorContext, 
+      extractFilesFromTraceback, 
+      getErrorLines 
+    } = await import('../utils/traceback.js');
+    const chalk = await import('chalk');
+
+    // NOTE: Removed redundant directory_listing and discovered_files
+    // All file information is now consolidated in file_structure
+
+    // 1. Analyze command error output if present
+    if (commandDetails && (commandDetails.stderr || commandDetails.stdout)) {
+      console.log('🔍 Pre-populating cache: Analyzing error output...');
+      const combinedOutput = (commandDetails.stderr || '') + '\n' + (commandDetails.stdout || '');
+      
+      // Extract error context
+      const errorContext = buildErrorContext(combinedOutput, 5);
+      if (errorContext) {
+        knowledgeBase.error_context = errorContext;
+        console.log('  ✓ Error context extracted and cached');
+      }
+
+      // Extract files mentioned in traceback
+      const filesWithErrors = extractFilesFromTraceback(combinedOutput);
+      if (filesWithErrors.size > 0) {
+        const errorFiles = Array.from(filesWithErrors.keys());
+        knowledgeBase.error_analysis_notes.push({
+          type: 'traceback_analysis',
+          files_mentioned: errorFiles,
+          timestamp: new Date().toISOString()
+        });
+        console.log(`  ✓ Found ${errorFiles.length} files in error traceback: ${errorFiles.join(', ')}`);
+      }
+
+      // Parse current blocking error
+      const currentError = parseErrorFromOutput(combinedOutput);
+      if (currentError) {
+        knowledgeBase.error_analysis_notes.push({
+          type: 'initial_error_parse',
+          error: currentError,
+          timestamp: new Date().toISOString()
+        });
+        console.log(`  ✓ Parsed error: ${currentError.type} - ${currentError.message}`);
+      }
+    }
+
+    // 2. Get complete file structure (includes ls + pwd + tree functionality)
+    console.log('🔍 Pre-populating cache: Building project structure...');
+    console.log(`  ${chalk.default.blueBright.bold('$')} ${chalk.default.blueBright.bold('tree -L 3')}`);
+    try {
+      const fileStructure = await getFileStructureData(currentDirectory, 3, false);
+      if (fileStructure.status === 'success') {
+        knowledgeBase.file_structure = {
+          tree_structure: fileStructure.tree_structure,
+          flat_files: fileStructure.flat_files,
+          metadata: fileStructure.metadata,
+          max_depth: 3,
+          included_hidden: false, // Initial scan excludes hidden files
+          cached_at: new Date().toISOString()
+        };
+        console.log(`  ✓ Project structure mapped (${fileStructure.metadata.total_files} files, ${fileStructure.metadata.relevant_files} relevant)`);
+        console.log(`  ✓ Filtered ${fileStructure.metadata.filtered_out} non-essential files (kept ${fileStructure.metadata.code_files} code + ${fileStructure.metadata.relevant_files - fileStructure.metadata.code_files} config/docs)`);
+      }
+    } catch (structureError) {
+      console.log(`  ✗ Failed to build project structure: ${structureError.message}`);
+    }
+
+    console.log('✅ Knowledge base pre-population complete');
+    
+    // Create file_state from file_structure data for intelligent tool behavior
+    const fileState = {
+      discovered_files: knowledgeBase.file_structure ? 
+        knowledgeBase.file_structure.flat_files.map(f => f.name) : [],
+      primary_error_file: null,
+      file_mappings: {}
+    };
+    
+    // If we have error analysis, set primary error file and create mappings
+    const errorFiles = knowledgeBase.error_analysis_notes
+      .filter(note => note.type === 'traceback_analysis')
+      .flatMap(note => note.files_mentioned || []);
+    
+    if (errorFiles.length > 0 && knowledgeBase.file_structure) {
+      const discoveredFiles = knowledgeBase.file_structure.flat_files.map(f => f.name);
+      
+      // Find primary error file (first match)
+      fileState.primary_error_file = discoveredFiles.find(f => 
+        errorFiles.some(ef => f.includes(ef.split('/').pop()) || ef.includes(f))
+      ) || null;
+      
+      // Create file mappings for intelligent resolution
+      for (const errorFile of errorFiles) {
+        const fileName = errorFile.split('/').pop();
+        const match = discoveredFiles.find(f => 
+          f === fileName || f.includes(fileName.replace(/\.[^.]*$/, ''))
+        );
+        if (match && fileName !== match) {
+          fileState.file_mappings[fileName] = match;
+        }
+      }
+      
+      if (fileState.primary_error_file) {
+        console.log(`  ✓ Set primary error file: ${fileState.primary_error_file}`);
+      }
+      if (Object.keys(fileState.file_mappings).length > 0) {
+        console.log(`  ✓ Created ${Object.keys(fileState.file_mappings).length} file mappings`);
+      }
+    }
+    
+    knowledgeBase.file_state = fileState;
+    return knowledgeBase;
+
+  } catch (error) {
+    console.log(`⚠️ Error during knowledge base initialization: ${error.message}`);
+    return {
+      files_read: {},
+      error_analysis_notes: [{
+        type: 'initialization_error',
+        error: error.message,
+        timestamp: new Date().toISOString()
+      }]
+    };
+  }
+}
+
+/**
+ * Creates initial agent context from user request and command details
+ * Automatically populates directory information and error analysis
+ */
+export async function createInitialAgentContext(userRequest, commandDetails, currentDirectory) {
+  // Pre-populate knowledge base with directory information
+  const knowledgeBase = await initializeKnowledgeBase(commandDetails, currentDirectory);
+  
   return {
     initial_user_request: userRequest || "Debug the error from the last command",
     initial_command_run: commandDetails || {
@@ -97,10 +365,9 @@ export function createInitialAgentContext(userRequest, commandDetails, currentDi
     },
     current_working_directory: currentDirectory,
     session_history: [],
-    knowledge_base: {
-      files_read: {},
-      error_analysis_notes: []
-    },
+    knowledge_base: knowledgeBase,
+    file_state: knowledgeBase.file_state,
+    
     // NEW: Track solved issues
     solved_issues: [],
     
@@ -371,18 +638,7 @@ export function updateAgentContext(context, step, thought, actionTaken, result) 
       updatedContext.knowledge_base.files_read[result.file_path] = result.content;
     }
     
-    // If we analyzed an error, add to analysis notes
-    if ((actionTaken.tool_used === "initial_error_analyzer" || actionTaken.tool_to_use === "initial_error_analyzer") && result.analysis) {
-      updatedContext.knowledge_base.error_analysis_notes.push(
-        `Error analysis: ${JSON.stringify(result.analysis, null, 2)}`
-      );
-      
-      // NEW: Persist file state from initial error analyzer
-      if (result.file_state) {
-        updatedContext.file_state = result.file_state;
-        console.log(`🔧 Persisted file state: ${result.file_state.discovered_files.length} files, primary: ${result.file_state.primary_error_file}`);
-      }
-    }
+    // Note: Error analysis is now done during initialization, not as a tool action
   }
   
   return updatedContext;
@@ -400,8 +656,7 @@ export function optimizeAgentContext(agentContext, maxTokens = 8000) {
     const relevantSteps = context.session_history.filter(step => 
       step.step > (context.session_history.length - 5) || // Last 5 steps
       (step.action_taken.tool_used === "propose_code_patch" || step.action_taken.tool_to_use === "propose_code_patch") || // Important actions
-      (step.action_taken.tool_used === "propose_fix_by_command" || step.action_taken.tool_to_use === "propose_fix_by_command") ||
-      (step.action_taken.tool_used === "initial_error_analyzer" || step.action_taken.tool_to_use === "initial_error_analyzer")
+      (step.action_taken.tool_used === "propose_fix_by_command" || step.action_taken.tool_to_use === "propose_fix_by_command")
     );
     
     // If we removed too much, keep at least last 3 steps
@@ -523,61 +778,46 @@ export function buildAgentPrompt(agentContext) {
     statusSummary += "\n💡 Use these exact file names for all operations!\n";
   }
   
-  // Add specific file guidance from error analysis
-  const latestAnalysis = optimizedContext.session_history.find(step => 
-    step.action_taken?.tool_to_use === 'initial_error_analyzer' || 
-    step.action_taken?.tool_used === 'initial_error_analyzer'
-  );
   
-  if (latestAnalysis?.result?.analysis?.files_to_read) {
-    statusSummary += `\n📁 FILES TO READ: ${latestAnalysis.result.analysis.files_to_read.join(', ')}`;
+  // Add complete project structure  
+  if (optimizedContext.knowledge_base.file_structure) {
+    const fs = optimizedContext.knowledge_base.file_structure;
+    statusSummary += `\n🌳 PROJECT STRUCTURE (${fs.metadata.total_files} total files, ${fs.metadata.relevant_files} relevant files):`;
+    statusSummary += `\n📊 CONTENT: ${fs.metadata.code_files} code files + ${fs.metadata.relevant_files - fs.metadata.code_files} config/docs (${fs.metadata.filtered_out} filtered out)`;
+    statusSummary += `\n📂 EXTENSIONS: ${fs.metadata.relevant_extensions.join(', ')}`;
+    statusSummary += `\n📁 STRUCTURE: Complete hierarchy in knowledge_base.file_structure.tree_structure`;
+    statusSummary += `\n📄 FILES: ${fs.metadata.relevant_files} debugging-relevant files in knowledge_base.file_structure.flat_files`;
   }
   
-  if (latestAnalysis?.result?.analysis?.immediate_next_action) {
-    statusSummary += `\n⚡ NEXT ACTION: ${latestAnalysis.result.analysis.immediate_next_action}`;
+  // Add error analysis from pre-populated knowledge base
+  const errorAnalysisNotes = optimizedContext.knowledge_base.error_analysis_notes || [];
+  for (const note of errorAnalysisNotes) {
+    if (note.type === 'traceback_analysis' && note.files_mentioned) {
+      statusSummary += `\n🎯 ERROR FILES: ${note.files_mentioned.join(', ')}`;
+    }
+    if (note.type === 'initial_error_parse' && note.error) {
+      statusSummary += `\n⚠️ PARSED ERROR: ${note.error.type} - ${note.error.message}`;
+    }
   }
   
   const currentStep = optimizedContext.session_history.length + 1;
-  const isFirstStep = currentStep === 1;
-  
-  // NEW: Provide exact command details for initial_error_analyzer
-  let commandDetailsForLLM = '';
-  if (isFirstStep && optimizedContext.initial_command_run) {
-    commandDetailsForLLM = `\n📋 EXACT COMMAND DETAILS FOR initial_error_analyzer:
-{
-  "command_string": "${optimizedContext.initial_command_run.command_string}",
-  "stdout": "${(optimizedContext.initial_command_run.stdout || '').replace(/"/g, '\\"')}",
-  "stderr": "${(optimizedContext.initial_command_run.stderr || '').replace(/"/g, '\\"')}",
-  "exit_code": ${optimizedContext.initial_command_run.exit_code}
-}
-⚠️ Use EXACTLY this object for initial_error_analyzer parameters!
-`;
-  }
   
   const taskPrompt = `${statusSummary}
-${commandDetailsForLLM}
 
 CURRENT CONTEXT:
 ${JSON.stringify(optimizedContext, null, 2)}
-
-${isFirstStep ? `
-🚨 THIS IS STEP 1 - YOU MUST USE initial_error_analyzer TOOL 🚨
-MANDATORY: tool_to_use MUST be "initial_error_analyzer"
-NO OTHER TOOL IS ALLOWED FOR STEP 1
-USE THE EXACT COMMAND DETAILS PROVIDED ABOVE!
-` : ''}
 
 Choose your next action based on the above context. Focus on:
 - The current_blocking_error (if any) - this is your PRIMARY focus
 - Your solved_issues to avoid repeating successful actions
 - Your recent_actions to avoid redundant work
 - The initial_user_request and what the user is trying to achieve
-- Information in your knowledge_base from previous investigations
+- Information in your knowledge_base from previous investigations (directory listing, discovered files, error analysis)
 
 Available tools: ${optimizedContext.available_tools.map(t => t.name).join(', ')}
 
 CRITICAL REMINDERS:
-1. ${isFirstStep ? 'STEP 1: Use initial_error_analyzer - MANDATORY' : 'WORKING CODE IS THE GOAL - Fix it fast'}
+1. WORKING CODE IS THE GOAL - Fix it fast using the pre-populated knowledge base
 2. SPEED OVER ANALYSIS: Simple errors need simple fixes, not investigation
 3. Focus ONLY on current_blocking_error (ignore historical errors) 
 4. If you can see the fix in the error message, apply it immediately

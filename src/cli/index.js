@@ -216,7 +216,7 @@ async function debugLoop(initialCmd, limit, currentModel, userContext = '') {
       exit_code: ok ? 0 : 1
     };
     
-    let agentContext = createInitialAgentContext(
+    let agentContext = await createInitialAgentContext(
       userContext,
       commandDetails, 
       currentDir
